@@ -233,6 +233,15 @@ typedef struct _ERESOURCE
     KSPIN_LOCK SpinLock;
 } ERESOURCE, *PERESOURCE;
 
+typedef struct _EX_RUNDOWN_REF
+{
+    union
+    {
+        ULONG_PTR Count;
+        void *Ptr;
+    };
+} EX_RUNDOWN_REF, *PEX_RUNDOWN_REF;
+
 typedef struct _IO_TIMER *PIO_TIMER;
 typedef struct _IO_TIMER_ROUTINE *PIO_TIMER_ROUTINE;
 typedef struct _ETHREAD *PETHREAD;
@@ -1721,6 +1730,8 @@ NTSTATUS  WINAPI DbgQueryDebugFilterState(ULONG, ULONG);
 
 void    FASTCALL ExAcquireFastMutex(FAST_MUTEX*);
 void    FASTCALL ExAcquireFastMutexUnsafe(PFAST_MUTEX);
+BOOLEAN FASTCALL ExAcquireRundownProtection(PEX_RUNDOWN_REF);
+BOOLEAN FASTCALL ExAcquireRundownProtectionEx(PEX_RUNDOWN_REF,ULONG);
 BOOLEAN   WINAPI ExAcquireResourceExclusiveLite(ERESOURCE*,BOOLEAN);
 BOOLEAN   WINAPI ExAcquireResourceSharedLite(ERESOURCE*,BOOLEAN);
 BOOLEAN   WINAPI ExAcquireSharedStarveExclusive(ERESOURCE*,BOOLEAN);
@@ -1741,6 +1752,7 @@ ULONG     WINAPI ExGetSharedWaiterCount(ERESOURCE*);
 void      WINAPI ExInitializeNPagedLookasideList(PNPAGED_LOOKASIDE_LIST,PALLOCATE_FUNCTION,PFREE_FUNCTION,ULONG,SIZE_T,ULONG,USHORT);
 void      WINAPI ExInitializePagedLookasideList(PPAGED_LOOKASIDE_LIST,PALLOCATE_FUNCTION,PFREE_FUNCTION,ULONG,SIZE_T,ULONG,USHORT);
 NTSTATUS  WINAPI ExInitializeResourceLite(ERESOURCE*);
+void    FASTCALL ExInitializeRundownProtection(PEX_RUNDOWN_REF);
 PSLIST_ENTRY WINAPI ExInterlockedFlushSList(PSLIST_HEADER);
 PSLIST_ENTRY WINAPI ExInterlockedPopEntrySList(PSLIST_HEADER,PKSPIN_LOCK);
 PSLIST_ENTRY WINAPI ExInterlockedPushEntrySList(PSLIST_HEADER,PSLIST_ENTRY,PKSPIN_LOCK);
@@ -1748,11 +1760,16 @@ LIST_ENTRY * WINAPI ExInterlockedRemoveHeadList(LIST_ENTRY*,KSPIN_LOCK*);
 BOOLEAN   WINAPI ExIsResourceAcquiredExclusiveLite(ERESOURCE*);
 ULONG     WINAPI ExIsResourceAcquiredSharedLite(ERESOURCE*);
 void *    WINAPI ExRegisterCallback(PCALLBACK_OBJECT,PCALLBACK_FUNCTION,void*);
+void    FASTCALL ExReInitializeRundownProtection(PEX_RUNDOWN_REF);
 void    FASTCALL ExReleaseFastMutex(FAST_MUTEX*);
 void    FASTCALL ExReleaseFastMutexUnsafe(PFAST_MUTEX);
 void      WINAPI ExReleaseResourceForThreadLite(ERESOURCE*,ERESOURCE_THREAD);
+void    FASTCALL ExReleaseRundownProtection(PEX_RUNDOWN_REF);
+void    FASTCALL ExReleaseRundownProtectionEx(PEX_RUNDOWN_REF,ULONG);
+void    FASTCALL ExRundownCompleted(PEX_RUNDOWN_REF);
 ULONG     WINAPI ExSetTimerResolution(ULONG,BOOLEAN);
 void      WINAPI ExUnregisterCallback(void*);
+void    FASTCALL ExWaitForRundownProtectionRelease(PEX_RUNDOWN_REF);
 
 #define PLUGPLAY_REGKEY_DEVICE            1
 #define PLUGPLAY_REGKEY_DRIVER            2

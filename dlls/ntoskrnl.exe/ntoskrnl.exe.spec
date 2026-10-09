@@ -2,22 +2,22 @@
 @ stdcall EtwUnregister(int64)
 @ stdcall -arch=!i386 ExAcquireFastMutex(ptr)
 @ stdcall -fastcall ExAcquireFastMutexUnsafe(ptr)
-@ stub ExAcquireRundownProtection
-@ stub ExAcquireRundownProtectionEx
-@ stub ExInitializeRundownProtection
+@ stdcall -fastcall ExAcquireRundownProtection(ptr)
+@ stdcall -fastcall ExAcquireRundownProtectionEx(ptr long)
+@ stdcall -fastcall ExInitializeRundownProtection(ptr)
 @ stub ExInterlockedAddLargeStatistic
 @ stub ExInterlockedCompareExchange64
 @ stdcall -fastcall -arch=i386 ExInterlockedFlushSList(ptr) NTOSKRNL_ExInterlockedFlushSList
 @ stdcall -fastcall -arch=i386 ExInterlockedPopEntrySList(ptr ptr) NTOSKRNL_ExInterlockedPopEntrySList
 @ stdcall -fastcall -arch=i386 ExInterlockedPushEntrySList (ptr ptr ptr) NTOSKRNL_ExInterlockedPushEntrySList
-@ stub ExReInitializeRundownProtection
+@ stdcall -fastcall ExReInitializeRundownProtection(ptr)
 @ stdcall -arch=!i386 ExReleaseFastMutex(ptr)
 @ stdcall -fastcall ExReleaseFastMutexUnsafe(ptr)
 @ stdcall -fastcall ExReleaseResourceLite(ptr)
-@ stub ExReleaseRundownProtection
-@ stub ExReleaseRundownProtectionEx
-@ stub ExRundownCompleted
-@ stub ExWaitForRundownProtectionRelease
+@ stdcall -fastcall ExReleaseRundownProtection(ptr)
+@ stdcall -fastcall ExReleaseRundownProtectionEx(ptr long)
+@ stdcall -fastcall ExRundownCompleted(ptr)
+@ stdcall -fastcall ExWaitForRundownProtectionRelease(ptr)
 @ stub ExfAcquirePushLockExclusive
 @ stub ExfAcquirePushLockShared
 @ stub ExfInterlockedAddUlong

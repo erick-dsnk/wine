@@ -1446,6 +1446,383 @@ static void test_ob_reference(void)
     ok(!status, "ZwClose failed: %#lx\n", status);
 }
 
+/* Resolve these dynamically so that the test driver can load on older systems. */
+static void (FASTCALL *pExInitializeRundownProtection)(EX_RUNDOWN_REF *);
+static BOOLEAN (FASTCALL *pExAcquireRundownProtection)(EX_RUNDOWN_REF *);
+static BOOLEAN (FASTCALL *pExAcquireRundownProtectionEx)(EX_RUNDOWN_REF *, ULONG);
+static void (FASTCALL *pExReleaseRundownProtection)(EX_RUNDOWN_REF *);
+static void (FASTCALL *pExReleaseRundownProtectionEx)(EX_RUNDOWN_REF *, ULONG);
+static void (FASTCALL *pExWaitForRundownProtectionRelease)(EX_RUNDOWN_REF *);
+static void (FASTCALL *pExRundownCompleted)(EX_RUNDOWN_REF *);
+static void (FASTCALL *pExReInitializeRundownProtection)(EX_RUNDOWN_REF *);
+
+#define RUNDOWN_THREADS 8
+struct rundown_test_context
+{
+    EX_RUNDOWN_REF rundown;
+    KEVENT started, done, run, release, ready[RUNDOWN_THREADS];
+    LONG active, acquired, rejected;
+    BOOLEAN wait_created;
+};
+
+struct rundown_worker_context
+{
+    struct rundown_test_context *context;
+    unsigned int index;
+};
+
+static HANDLE create_rundown_thread(PKSTART_ROUTINE proc, void *arg)
+{
+    OBJECT_ATTRIBUTES attr;
+    NTSTATUS status;
+    HANDLE thread = NULL;
+
+    InitializeObjectAttributes(&attr, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    status = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, &attr, NULL, NULL, proc, arg);
+    ok(!status, "PsCreateSystemThread failed: %#lx\n", status);
+    return thread;
+}
+
+static BOOL join_rundown_thread(HANDLE thread)
+{
+    NTSTATUS status;
+
+    if (!thread) return TRUE;
+    status = wait_single_handle(thread, -5000 * 10000);
+    ok(!status, "Rundown thread did not finish: %#lx\n", status);
+    if (status)
+    {
+        /* Retaining thread data alone is insufficient: the callback must not
+         * return into unloaded driver code if it wakes later. */
+        driver_obj->DriverUnload = NULL;
+        trace("Disabling driver unload because a rundown thread is still outstanding.\n");
+    }
+    ZwClose(thread);
+    return !status;
+}
+
+static void WINAPI rundown_wait_thread(void *arg)
+{
+    struct rundown_test_context *context = arg;
+
+    KeSetEvent(&context->started, IO_NO_INCREMENT, FALSE);
+    pExWaitForRundownProtectionRelease(&context->rundown);
+    KeSetEvent(&context->done, IO_NO_INCREMENT, FALSE);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+/* Observe the public acquisition result, rather than depending on the internal
+ * representation of an in-progress wait. The existing references stay held. */
+static BOOL wait_for_rundown(EX_RUNDOWN_REF *rundown)
+{
+    LARGE_INTEGER delay;
+    unsigned int i;
+
+    delay.QuadPart = -10000;
+    for (i = 0; i < 1000; ++i)
+    {
+        if (!pExAcquireRundownProtection(rundown)) return TRUE;
+        pExReleaseRundownProtection(rundown);
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+    ok(0, "Acquisition remained possible after the waiter started\n");
+    return FALSE;
+}
+
+static BOOL test_rundown_wait(struct rundown_test_context *context, ULONG references)
+{
+    HANDLE thread;
+    BOOLEAN ret;
+    NTSTATUS status;
+
+    KeResetEvent(&context->started);
+    KeResetEvent(&context->done);
+    if (references)
+    {
+        ret = pExAcquireRundownProtectionEx(&context->rundown, references);
+        ok(ret, "Failed to acquire %lu references\n", references);
+        if (!ret) return FALSE;
+    }
+    thread = create_rundown_thread(rundown_wait_thread, context);
+    if (!thread)
+    {
+        if (references) pExReleaseRundownProtectionEx(&context->rundown, references);
+        return FALSE;
+    }
+    status = wait_single(&context->started, -5000 * 10000);
+    ok(!status, "Waiter did not start: %#lx\n", status);
+    if (references)
+    {
+        wait_for_rundown(&context->rundown);
+        status = wait_single(&context->done, -50 * 10000);
+        ok(status == STATUS_TIMEOUT, "Wait returned with references held: %#lx\n", status);
+        ret = pExAcquireRundownProtectionEx(&context->rundown, 2);
+        ok(!ret, "Ex acquisition succeeded after rundown began\n");
+        if (ret) pExReleaseRundownProtectionEx(&context->rundown, 2);
+        /* A partial release must not wake the waiter. */
+        pExReleaseRundownProtectionEx(&context->rundown, references - 1);
+        status = wait_single(&context->done, -50 * 10000);
+        ok(status == STATUS_TIMEOUT, "Wait returned before the last release: %#lx\n", status);
+        pExReleaseRundownProtection(&context->rundown);
+    }
+    if (!join_rundown_thread(thread)) return FALSE;
+    ret = pExAcquireRundownProtection(&context->rundown);
+    ok(!ret, "Acquisition succeeded after rundown finished\n");
+    if (ret) pExReleaseRundownProtection(&context->rundown);
+    return TRUE;
+}
+
+static void WINAPI rundown_acquire_thread(void *arg)
+{
+    struct rundown_worker_context *worker = arg;
+    struct rundown_test_context *context = worker->context;
+    BOOLEAN held, ret;
+    NTSTATUS status;
+    unsigned int phase, i;
+
+    held = pExAcquireRundownProtection(&context->rundown);
+    ok(held, "Worker %u failed its initial acquisition\n", worker->index);
+    if (held) InterlockedIncrement(&context->active);
+    for (phase = 0; phase < 2; ++phase)
+    {
+        for (i = 0; i < 1000; ++i)
+        {
+            ret = pExAcquireRundownProtectionEx(&context->rundown, 3);
+            if (ret)
+            {
+                InterlockedExchangeAdd(&context->active, 3);
+                InterlockedIncrement(&context->acquired);
+                InterlockedExchangeAdd(&context->active, -3);
+                pExReleaseRundownProtectionEx(&context->rundown, 2);
+                pExReleaseRundownProtection(&context->rundown);
+            }
+            else
+            {
+                ok(phase, "Acquisition failed before rundown began\n");
+                InterlockedIncrement(&context->rejected);
+            }
+        }
+        if (!phase)
+        {
+            KeSetEvent(&context->ready[worker->index], IO_NO_INCREMENT, FALSE);
+            status = wait_single(&context->run, -5000 * 10000);
+            ok(!status, "Worker start timed out: %#lx\n", status);
+        }
+    }
+    status = wait_single(&context->release, -5000 * 10000);
+    ok(!status, "Worker release timed out: %#lx\n", status);
+    if (context->wait_created)
+    {
+        ret = pExAcquireRundownProtection(&context->rundown);
+        ok(!ret, "Worker %u acquired after rundown began\n", worker->index);
+        if (ret) pExReleaseRundownProtection(&context->rundown);
+        else InterlockedIncrement(&context->rejected);
+    }
+    if (held)
+    {
+        InterlockedDecrement(&context->active);
+        pExReleaseRundownProtection(&context->rundown);
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static BOOL test_rundown_contention(struct rundown_test_context *context,
+        struct rundown_worker_context *workers)
+{
+    HANDLE threads[RUNDOWN_THREADS] = {0}, waiter;
+    BOOL finished = TRUE;
+    NTSTATUS status;
+    unsigned int i;
+    BOOLEAN ret;
+
+    pExReInitializeRundownProtection(&context->rundown);
+    KeResetEvent(&context->started);
+    KeResetEvent(&context->done);
+    ret = pExAcquireRundownProtection(&context->rundown);
+    ok(ret, "Failed to acquire the main reference\n");
+    if (!ret) return TRUE;
+    for (i = 0; i < RUNDOWN_THREADS; ++i)
+    {
+        workers[i].context = context;
+        workers[i].index = i;
+        threads[i] = create_rundown_thread(rundown_acquire_thread, &workers[i]);
+    }
+    for (i = 0; i < RUNDOWN_THREADS; ++i)
+    {
+        if (!threads[i]) continue;
+        status = wait_single(&context->ready[i], -5000 * 10000);
+        ok(!status, "Worker %u did not become ready: %#lx\n", i, status);
+    }
+    waiter = create_rundown_thread(rundown_wait_thread, context);
+    context->wait_created = !!waiter;
+    if (waiter)
+    {
+        status = wait_single(&context->started, -5000 * 10000);
+        ok(!status, "Waiter did not start: %#lx\n", status);
+    }
+    KeSetEvent(&context->run, IO_NO_INCREMENT, FALSE);
+    if (waiter)
+    {
+        wait_for_rundown(&context->rundown);
+        status = wait_single(&context->done, -50 * 10000);
+        ok(status == STATUS_TIMEOUT, "Wait returned while workers held references: %#lx\n", status);
+    }
+    pExReleaseRundownProtection(&context->rundown);
+    if (waiter && InterlockedCompareExchange(&context->active, 0, 0))
+    {
+        status = wait_single(&context->done, -50 * 10000);
+        ok(status == STATUS_TIMEOUT, "Wait returned before worker releases: %#lx\n", status);
+    }
+    KeSetEvent(&context->release, IO_NO_INCREMENT, FALSE);
+    for (i = 0; i < RUNDOWN_THREADS; ++i)
+        if (!join_rundown_thread(threads[i])) finished = FALSE;
+    if (!join_rundown_thread(waiter)) finished = FALSE;
+    if (!finished) return FALSE;
+    ok(!context->active, "%ld references remain after all threads finished\n", context->active);
+    ok(context->acquired >= RUNDOWN_THREADS * 1000,
+            "Only %ld acquisitions completed before teardown\n", context->acquired);
+    if (waiter)
+    {
+        ok(context->rejected >= RUNDOWN_THREADS, "Only %ld post-rundown rejections\n", context->rejected);
+        ret = pExAcquireRundownProtection(&context->rundown);
+        ok(!ret, "Acquisition succeeded after concurrent rundown\n");
+        if (ret) pExReleaseRundownProtection(&context->rundown);
+    }
+    return TRUE;
+}
+
+struct rundown_lifetime_context
+{
+    EX_RUNDOWN_REF *rundown;
+    KEVENT started;
+};
+
+static void WINAPI rundown_free_thread(void *arg)
+{
+    struct rundown_lifetime_context *context = arg;
+    EX_RUNDOWN_REF *rundown = context->rundown;
+
+    KeSetEvent(&context->started, IO_NO_INCREMENT, FALSE);
+    pExWaitForRundownProtectionRelease(rundown);
+    /* The last releaser may still be returning from its release call. The
+     * protected allocation must already be safe to destroy at this point. */
+    ExFreePool(rundown);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static BOOL test_rundown_lifetime(void)
+{
+    struct rundown_lifetime_context *context;
+    EX_RUNDOWN_REF *rundown;
+    unsigned int i;
+    NTSTATUS status;
+    HANDLE thread;
+    BOOLEAN ret;
+
+    for (i = 0; i < 8; ++i)
+    {
+        context = ExAllocatePool(NonPagedPool, sizeof(*context));
+        rundown = ExAllocatePool(NonPagedPool, sizeof(*rundown));
+        ok(context && rundown, "Failed to allocate lifetime test contexts\n");
+        if (!context || !rundown)
+        {
+            if (context) ExFreePool(context);
+            if (rundown) ExFreePool(rundown);
+            return FALSE;
+        }
+        context->rundown = rundown;
+        KeInitializeEvent(&context->started, NotificationEvent, FALSE);
+        pExInitializeRundownProtection(rundown);
+        ret = pExAcquireRundownProtection(rundown);
+        ok(ret, "Lifetime test initial acquisition failed\n");
+        if (!ret)
+        {
+            ExFreePool(rundown);
+            ExFreePool(context);
+            return FALSE;
+        }
+        thread = create_rundown_thread(rundown_free_thread, context);
+        if (!thread)
+        {
+            pExReleaseRundownProtection(rundown);
+            ExFreePool(rundown);
+            ExFreePool(context);
+            return FALSE;
+        }
+        status = wait_single(&context->started, -5000 * 10000);
+        ok(!status, "Lifetime waiter did not start: %#lx\n", status);
+        wait_for_rundown(rundown);
+        pExReleaseRundownProtection(rundown);
+        /* Never dereference rundown again: the waiter owns its destruction. */
+        if (!join_rundown_thread(thread)) return FALSE;
+        ExFreePool(context);
+    }
+    return TRUE;
+}
+
+static BOOL test_rundown(void)
+{
+    struct rundown_worker_context *workers;
+    struct rundown_test_context *context;
+    BOOLEAN ret;
+    unsigned int i;
+
+    pExInitializeRundownProtection = get_proc_address("ExInitializeRundownProtection");
+    pExAcquireRundownProtection = get_proc_address("ExAcquireRundownProtection");
+    pExAcquireRundownProtectionEx = get_proc_address("ExAcquireRundownProtectionEx");
+    pExReleaseRundownProtection = get_proc_address("ExReleaseRundownProtection");
+    pExReleaseRundownProtectionEx = get_proc_address("ExReleaseRundownProtectionEx");
+    pExWaitForRundownProtectionRelease = get_proc_address("ExWaitForRundownProtectionRelease");
+    pExRundownCompleted = get_proc_address("ExRundownCompleted");
+    pExReInitializeRundownProtection = get_proc_address("ExReInitializeRundownProtection");
+    if (!pExInitializeRundownProtection || !pExAcquireRundownProtection || !pExAcquireRundownProtectionEx
+            || !pExReleaseRundownProtection || !pExReleaseRundownProtectionEx
+            || !pExWaitForRundownProtectionRelease || !pExRundownCompleted || !pExReInitializeRundownProtection)
+    {
+        win_skip("Ordinary rundown protection exports are not all available.\n");
+        return TRUE;
+    }
+
+    context = ExAllocatePool(NonPagedPool, sizeof(*context));
+    workers = ExAllocatePool(NonPagedPool, RUNDOWN_THREADS * sizeof(*workers));
+    ok(context && workers, "Failed to allocate rundown test contexts\n");
+    if (!context || !workers)
+    {
+        if (context) ExFreePool(context);
+        if (workers) ExFreePool(workers);
+        return TRUE;
+    }
+    memset(context, 0, sizeof(*context));
+    KeInitializeEvent(&context->started, NotificationEvent, FALSE);
+    KeInitializeEvent(&context->done, NotificationEvent, FALSE);
+    KeInitializeEvent(&context->run, NotificationEvent, FALSE);
+    KeInitializeEvent(&context->release, NotificationEvent, FALSE);
+    for (i = 0; i < RUNDOWN_THREADS; ++i)
+        KeInitializeEvent(&context->ready[i], NotificationEvent, FALSE);
+
+    memset(&context->rundown, 0xcc, sizeof(context->rundown));
+    pExInitializeRundownProtection(&context->rundown);
+    ret = pExAcquireRundownProtection(&context->rundown);
+    ok(ret, "Initial acquisition failed\n");
+    if (ret) pExReleaseRundownProtection(&context->rundown);
+    if (!test_rundown_wait(context, 0)) return FALSE;
+    /* Waiting again after completion must return, and completion stays closed. */
+    if (!test_rundown_wait(context, 0)) return FALSE;
+    pExRundownCompleted(&context->rundown);
+    ret = pExAcquireRundownProtection(&context->rundown);
+    ok(!ret, "Acquisition succeeded after ExRundownCompleted\n");
+    if (ret) pExReleaseRundownProtection(&context->rundown);
+    pExReInitializeRundownProtection(&context->rundown);
+    if (!test_rundown_wait(context, 3)) return FALSE;
+    if (!test_rundown_contention(context, workers)) return FALSE;
+
+    /* If a bounded join above failed, retain the contexts: a still-running
+     * kernel thread may reference them, so freeing would be unsafe. */
+    ExFreePool(workers);
+    ExFreePool(context);
+    return test_rundown_lifetime();
+}
+
 static void check_resource_(int line, ERESOURCE *resource, ULONG exclusive_waiters,
         ULONG shared_waiters, BOOLEAN exclusive, ULONG shared_count)
 {
@@ -2477,6 +2854,7 @@ static NTSTATUS main_test(DEVICE_OBJECT *device, IRP *irp, IO_STACK_LOCATION *st
     test_lookaside_list();
     test_ob_reference();
     test_resource();
+    if (!test_rundown()) return STATUS_UNSUCCESSFUL;
     test_lookup_thread();
     test_IoAttachDeviceToDeviceStack();
     test_object_name();

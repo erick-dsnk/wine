@@ -39,6 +39,129 @@ enum object_type
 
 DECLARE_CRITICAL_SECTION(sync_cs);
 
+/* The low bit closes acquisition; the other bits hold twice the reference
+ * count. The active state is private to these routines, and does not need an
+ * allocated wait block. Only releases during rundown need rundown_cs. */
+#define RUNDOWN_ACTIVE 1
+
+DECLARE_CRITICAL_SECTION(rundown_cs);
+static RTL_CONDITION_VARIABLE rundown_cv = RTL_CONDITION_VARIABLE_INIT;
+
+static ULONG_PTR rundown_compare_exchange( EX_RUNDOWN_REF *ref, ULONG_PTR value, ULONG_PTR compare )
+{
+    return (ULONG_PTR)InterlockedCompareExchangePointer( &ref->Ptr, (void *)value, (void *)compare );
+}
+
+/***********************************************************************
+ *           ExInitializeRundownProtection   (NTOSKRNL.EXE.@)
+ */
+DEFINE_FASTCALL1_WRAPPER( ExInitializeRundownProtection )
+void FASTCALL ExInitializeRundownProtection( EX_RUNDOWN_REF *ref )
+{
+    InterlockedExchangePointer( &ref->Ptr, NULL );
+}
+
+/***********************************************************************
+ *           ExAcquireRundownProtectionEx   (NTOSKRNL.EXE.@)
+ */
+DEFINE_FASTCALL_WRAPPER( ExAcquireRundownProtectionEx, 8 )
+BOOLEAN FASTCALL ExAcquireRundownProtectionEx( EX_RUNDOWN_REF *ref, ULONG count )
+{
+    ULONG_PTR value = rundown_compare_exchange( ref, 0, 0 ), previous;
+
+    for (;;)
+    {
+        if (value & RUNDOWN_ACTIVE) return FALSE;
+        if ((ULONG_PTR)count > (~(ULONG_PTR)0 >> 1) - (value >> 1)) return FALSE;
+        previous = rundown_compare_exchange( ref, value + ((ULONG_PTR)count << 1), value );
+        if (previous == value) return TRUE;
+        value = previous;
+    }
+}
+
+/***********************************************************************
+ *           ExAcquireRundownProtection   (NTOSKRNL.EXE.@)
+ */
+DEFINE_FASTCALL1_WRAPPER( ExAcquireRundownProtection )
+BOOLEAN FASTCALL ExAcquireRundownProtection( EX_RUNDOWN_REF *ref )
+{
+    return ExAcquireRundownProtectionEx( ref, 1 );
+}
+
+/***********************************************************************
+ *           ExReleaseRundownProtectionEx   (NTOSKRNL.EXE.@)
+ */
+DEFINE_FASTCALL_WRAPPER( ExReleaseRundownProtectionEx, 8 )
+void FASTCALL ExReleaseRundownProtectionEx( EX_RUNDOWN_REF *ref, ULONG count )
+{
+    ULONG_PTR value = rundown_compare_exchange( ref, 0, 0 ), previous;
+
+    while (!(value & RUNDOWN_ACTIVE))
+    {
+        previous = rundown_compare_exchange( ref, value - ((ULONG_PTR)count << 1), value );
+        if (previous == value) return;
+        value = previous;
+    }
+
+    EnterCriticalSection( &rundown_cs );
+    value = rundown_compare_exchange( ref, 0, 0 );
+    value -= (ULONG_PTR)count << 1;
+    InterlockedExchangePointer( &ref->Ptr, (void *)value );
+    if (value == RUNDOWN_ACTIVE) RtlWakeAllConditionVariable( &rundown_cv );
+    LeaveCriticalSection( &rundown_cs );
+}
+
+/***********************************************************************
+ *           ExReleaseRundownProtection   (NTOSKRNL.EXE.@)
+ */
+DEFINE_FASTCALL1_WRAPPER( ExReleaseRundownProtection )
+void FASTCALL ExReleaseRundownProtection( EX_RUNDOWN_REF *ref )
+{
+    ExReleaseRundownProtectionEx( ref, 1 );
+}
+
+/***********************************************************************
+ *           ExWaitForRundownProtectionRelease   (NTOSKRNL.EXE.@)
+ */
+DEFINE_FASTCALL1_WRAPPER( ExWaitForRundownProtectionRelease )
+void FASTCALL ExWaitForRundownProtectionRelease( EX_RUNDOWN_REF *ref )
+{
+    ULONG_PTR value, previous;
+
+    EnterCriticalSection( &rundown_cs );
+    value = rundown_compare_exchange( ref, 0, 0 );
+    while (!(value & RUNDOWN_ACTIVE))
+    {
+        previous = rundown_compare_exchange( ref, value | RUNDOWN_ACTIVE, value );
+        if (previous == value) break;
+        value = previous;
+    }
+
+    /* Hold the lock across the final count check. The last releaser must
+     * finish its wake-up before the owner can return and free the object. */
+    while (rundown_compare_exchange( ref, 0, 0 ) != RUNDOWN_ACTIVE)
+        RtlSleepConditionVariableCS( &rundown_cv, &rundown_cs, NULL );
+    LeaveCriticalSection( &rundown_cs );
+}
+
+/***********************************************************************
+ *           ExRundownCompleted   (NTOSKRNL.EXE.@)
+ */
+DEFINE_FASTCALL1_WRAPPER( ExRundownCompleted )
+void FASTCALL ExRundownCompleted( EX_RUNDOWN_REF *ref )
+{
+    InterlockedExchangePointer( &ref->Ptr, (void *)RUNDOWN_ACTIVE );
+}
+
+/***********************************************************************
+ *           ExReInitializeRundownProtection   (NTOSKRNL.EXE.@)
+ */
+DEFINE_FASTCALL1_WRAPPER( ExReInitializeRundownProtection )
+void FASTCALL ExReInitializeRundownProtection( EX_RUNDOWN_REF *ref )
+{
+    InterlockedExchangePointer( &ref->Ptr, NULL );
+}
+
 /***********************************************************************
  *           KeWaitForMultipleObjects   (NTOSKRNL.EXE.@)
  */
