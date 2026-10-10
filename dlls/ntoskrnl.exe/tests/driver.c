@@ -37,6 +37,7 @@
 #include "ddk/ntifs.h"
 #include "ddk/wdm.h"
 #include "ddk/fltkernel.h"
+#include "wine/asm.h"
 
 #include "driver.h"
 
@@ -2396,6 +2397,331 @@ static void test_executable_pool(void)
 }
 #endif
 
+struct kernel_memory_worker_context
+{
+    KEVENT done;
+    volatile LONG failed;
+    unsigned int index;
+};
+
+static PVOID (WINAPI *pExAllocatePool2)(POOL_FLAGS, SIZE_T, ULONG);
+static NTSTATUS (WINAPI *pZwQueryVirtualMemory)(HANDLE, const void *, MEMORY_INFORMATION_CLASS,
+        void *, SIZE_T, SIZE_T *);
+
+#if defined(__x86_64__) && defined(__WINE_PE_BUILD)
+LONG WINAPI kernel_memory_nx_filter(EXCEPTION_POINTERS *exception, void *frame)
+{
+    const EXCEPTION_RECORD *record = exception->ExceptionRecord;
+    const void *target = *(void **)((char *)frame + 32);
+
+    return record->ExceptionCode == STATUS_ACCESS_VIOLATION && record->NumberParameters >= 2
+            && record->ExceptionInformation[0] == 8
+            && record->ExceptionInformation[1] == (ULONG_PTR)target
+            && record->ExceptionAddress == target
+            ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+NTSTATUS WINAPI kernel_memory_execute_nx(void *address);
+__ASM_GLOBAL_FUNC(kernel_memory_execute_nx,
+    "subq $40,%rsp\n\t"
+    ".seh_stackalloc 40\n\t"
+    ".seh_endprologue\n"
+    "movq %rcx,32(%rsp)\n\t"
+    ".Lkmem_call_begin:\n\t"
+    "call *%rcx\n"
+    /* The return PC must precede the epilogue so the caller's frame handler
+     * participates when the indirect target faults. Successful execution
+     * returns STATUS_SUCCESS, independently of the target's return value. */
+    "xorl %eax,%eax\n\t"
+    ".Lkmem_call_end:\n\t"
+    "addq $40,%rsp\n\t"
+    "ret\n\t"
+    ".Lkmem_call_recover:\n\t"
+    "movl $0xc0000005,%eax\n\t"
+    "addq $40,%rsp\n\t"
+    "ret\n\t"
+    ".seh_handler __C_specific_handler,@except\n\t"
+    ".seh_handlerdata\n\t"
+    ".long 1\n\t"
+    ".rva .Lkmem_call_begin,.Lkmem_call_end,kernel_memory_nx_filter,.Lkmem_call_recover\n\t"
+    ".text");
+#endif
+
+static void test_kernel_memory_mapping(const void *ptr, const char *name)
+{
+    MEMORY_BASIC_INFORMATION info;
+    SIZE_T returned;
+    NTSTATUS status;
+
+    if (!ptr)
+    {
+        ok(FALSE, "%s address is NULL\n", name);
+        return;
+    }
+    if (!pZwQueryVirtualMemory)
+    {
+        win_skip("ZwQueryVirtualMemory is unavailable; mapping type for %s was not checked.\n", name);
+        return;
+    }
+
+    memset(&info, 0, sizeof(info));
+    status = pZwQueryVirtualMemory((HANDLE)(LONG_PTR)-1, ptr, MemoryBasicInformation,
+            &info, sizeof(info), &returned);
+    ok(!status, "ZwQueryVirtualMemory(%s) failed: %#lx\n", name, status);
+    if (!status)
+    {
+        ok(returned == sizeof(info), "ZwQueryVirtualMemory(%s) returned %Iu bytes\n", name, returned);
+        ok(info.State == MEM_COMMIT, "%s state is %#lx\n", name, info.State);
+        ok(info.Type == MEM_MAPPED, "%s is not backed by a mapped section (type %#lx)\n", name, info.Type);
+    }
+}
+
+static void WINAPI kernel_memory_worker(void *arg)
+{
+    struct kernel_memory_worker_context *context = arg;
+    unsigned int i, j;
+    BYTE *ptr;
+
+    for (i = 0; i < 250; ++i)
+    {
+        SIZE_T size = 1 + ((i * 37 + context->index * 19) % 511);
+
+        ptr = pExAllocatePool2(POOL_FLAG_NON_PAGED, size, 0x6d656d4b);
+        if (!ptr)
+        {
+            InterlockedExchange(&context->failed, 1);
+            break;
+        }
+        for (j = 0; j < size; ++j) ptr[j] = (BYTE)(context->index ^ i ^ j);
+        for (j = 0; j < size; ++j)
+            if (ptr[j] != (BYTE)(context->index ^ i ^ j)) InterlockedExchange(&context->failed, 1);
+        ExFreePoolWithTag(ptr, 0x6d656d4b);
+    }
+
+    KeSetEvent(&context->done, IO_NO_INCREMENT, FALSE);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static void test_shared_kernel_memory(IRP *request_irp, DEVICE_OBJECT *device)
+{
+    static const unsigned char code[] = {0xb8, 0xef, 0xbe, 0xad, 0xde, 0xc3};
+    static const ULONG tag = 0x6d656d4b; /* Kmem */
+    struct kernel_memory_worker_context *workers;
+    HANDLE threads[4] = {0};
+    BYTE *ptr, *again, *blocks[128];
+    SIZE_T sizes[] = {1, 7, 16, 128, 1024};
+    unsigned int i, j, allocated = 0;
+    NTSTATUS status;
+    int (*func)(void);
+    BOOL workers_finished = TRUE;
+    IRP *allocated_irp;
+    MDL *allocated_mdl;
+
+    pExAllocatePool2 = get_proc_address("ExAllocatePool2");
+    ok(!!pExAllocatePool2, "ExAllocatePool2 is unavailable\n");
+    if (!pExAllocatePool2) return;
+
+    pZwQueryVirtualMemory = get_proc_address("ZwQueryVirtualMemory");
+    test_kernel_memory_mapping(request_irp->AssociatedIrp.SystemBuffer, "IRP system buffer");
+    test_kernel_memory_mapping(request_irp, "IOCTL IRP");
+    test_kernel_memory_mapping(device, "device object");
+    test_kernel_memory_mapping(driver_obj, "driver object");
+
+    ptr = ExAllocatePoolWithTag(NonPagedPool, 48, tag);
+    ok(!!ptr, "Legacy nonpaged pool wrapper failed to allocate\n");
+    if (ptr)
+    {
+        test_kernel_memory_mapping(ptr, "legacy nonpaged pool allocation");
+        ExFreePoolWithTag(ptr, tag);
+    }
+
+    ptr = ExAllocatePool(NonPagedPool, 32);
+    ok(!!ptr, "Legacy untagged pool wrapper failed to allocate\n");
+    if (ptr) ExFreePool(ptr);
+
+    allocated_irp = IoAllocateIrp(1, FALSE);
+    ok(!!allocated_irp, "IoAllocateIrp failed in shared-memory test\n");
+    if (allocated_irp)
+    {
+        test_kernel_memory_mapping(allocated_irp, "allocated IRP");
+        IoFreeIrp(allocated_irp);
+    }
+
+    ptr = pExAllocatePool2(POOL_FLAG_NON_PAGED, 4096, tag);
+    ok(!!ptr, "Failed to allocate MDL test buffer\n");
+    if (ptr)
+    {
+        allocated_mdl = IoAllocateMdl(ptr, 4096, FALSE, FALSE, NULL);
+        ok(!!allocated_mdl, "IoAllocateMdl failed in shared-memory test\n");
+        if (allocated_mdl)
+        {
+            test_kernel_memory_mapping(allocated_mdl, "allocated MDL");
+            IoFreeMdl(allocated_mdl);
+        }
+        ExFreePoolWithTag(ptr, tag);
+    }
+
+    ok(!pExAllocatePool2(0, 16, tag), "Zero pool flags unexpectedly allocated memory\n");
+    ok(!pExAllocatePool2(POOL_FLAG_NON_PAGED, 0, tag), "Zero-size pool allocation unexpectedly succeeded\n");
+    ok(!pExAllocatePool2(POOL_FLAG_NON_PAGED, 16, 0), "Zero-tag pool allocation unexpectedly succeeded\n");
+    ok(!pExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_USE_QUOTA, 16, tag),
+            "Unsupported quota pool flag unexpectedly allocated memory\n");
+    ok(!pExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_SESSION, 16, tag),
+            "Unsupported session pool flag unexpectedly allocated memory\n");
+    ok(!ExAllocatePoolWithTag((POOL_TYPE)32, 16, tag), "Unsupported legacy pool type unexpectedly allocated memory\n");
+
+    ptr = pExAllocatePool2(POOL_FLAG_NON_PAGED, 128, tag);
+    ok(!!ptr, "Failed to allocate ordinary nonpaged pool\n");
+    if (ptr)
+    {
+        test_kernel_memory_mapping(ptr, "nonpaged pool allocation");
+        for (i = 0; i < 128; ++i) ok(!ptr[i], "Default pool2 allocation byte %u is %#x, expected zero\n", i, ptr[i]);
+        memset(ptr, 0xa5, 128);
+        ExFreePoolWithTag(ptr, tag);
+
+        again = pExAllocatePool2(POOL_FLAG_NON_PAGED, 128, tag);
+        ok(!!again, "Failed to reallocate ordinary nonpaged pool\n");
+        if (again)
+        {
+            for (i = 0; i < 128; ++i)
+                ok(!again[i], "Reallocated pool2 byte %u is %#x, expected zero\n", i, again[i]);
+            ExFreePoolWithTag(again, tag);
+        }
+    }
+
+    ptr = pExAllocatePool2(POOL_FLAG_PAGED, 64, tag);
+    ok(!!ptr, "Failed to allocate paged pool2 memory\n");
+    if (ptr)
+    {
+        test_kernel_memory_mapping(ptr, "paged pool allocation");
+        ExFreePoolWithTag(ptr, tag);
+    }
+
+#if defined(__x86_64__) && defined(__WINE_PE_BUILD)
+    ptr = pExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(code), tag);
+    ok(!!ptr, "Failed to allocate NX pool2 memory\n");
+    if (ptr)
+    {
+        memcpy(ptr, code, sizeof(code));
+        status = kernel_memory_execute_nx(ptr);
+        ok(status == STATUS_ACCESS_VIOLATION, "NX pool execution returned %#lx instead of an access violation\n", status);
+        ExFreePoolWithTag(ptr, tag);
+    }
+#else
+    win_skip("Guarded NX execution fixture requires native x64 SEH.\n");
+#endif
+
+    ptr = pExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_CACHE_ALIGNED, 65, tag);
+    ok(!!ptr, "Failed to allocate cache-aligned pool\n");
+    if (ptr)
+    {
+        ok(!((ULONG_PTR)ptr & 63), "Cache-aligned allocation %p is not 64-byte aligned\n", ptr);
+        ExFreePoolWithTag(ptr, tag);
+    }
+
+    ptr = pExAllocatePool2(POOL_FLAG_NON_PAGED, 4096, tag);
+    ok(!!ptr, "Failed to allocate page-sized pool\n");
+    if (ptr)
+    {
+        ok(!((ULONG_PTR)ptr & 4095), "Page-sized allocation %p is not page aligned\n", ptr);
+        ExFreePoolWithTag(ptr, tag);
+    }
+
+    for (i = 0; i < ARRAY_SIZE(sizes); ++i)
+    {
+        ptr = pExAllocatePool2(POOL_FLAG_NON_PAGED, sizes[i], tag);
+        ok(!!ptr, "Failed to allocate %Iu-byte subpage pool\n", sizes[i]);
+        if (!ptr) continue;
+        ok(((ULONG_PTR)ptr & 4095) + sizes[i] <= 4096,
+                "%Iu-byte allocation %p crosses a page boundary\n", sizes[i], ptr);
+        ExFreePoolWithTag(ptr, tag);
+    }
+
+    ptr = pExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, 128, tag);
+    ok(!!ptr, "Failed to allocate explicitly uninitialized pool\n");
+    if (ptr)
+    {
+        memset(ptr, 0x5a, 128);
+        ExFreePoolWithTag(ptr, tag);
+    }
+
+#if defined(__i386__) || defined(__x86_64__)
+    func = pExAllocatePool2(POOL_FLAG_NON_PAGED_EXECUTE, sizeof(code), tag);
+    ok(!!func, "Failed to allocate executable pool2 memory\n");
+    if (func)
+    {
+        memcpy(func, code, sizeof(code));
+        ok(func() == 0xdeadbeef, "Executable pool2 returned unexpected value\n");
+#if defined(__x86_64__) && defined(__WINE_PE_BUILD)
+        status = kernel_memory_execute_nx(func);
+        ok(!status, "Guarded executable pool execution returned %#lx\n", status);
+#endif
+        ExFreePoolWithTag(func, tag);
+    }
+
+#if defined(__x86_64__) && defined(__WINE_PE_BUILD)
+    ptr = ExAllocatePoolWithTag((POOL_TYPE)(NonPagedPool | POOL_NX_ALLOCATION), sizeof(code), tag);
+    ok(!!ptr, "Failed to allocate legacy NX pool memory\n");
+    if (ptr)
+    {
+        memcpy(ptr, code, sizeof(code));
+        status = kernel_memory_execute_nx(ptr);
+        ok(status == STATUS_ACCESS_VIOLATION, "Legacy NX pool execution returned %#lx instead of an access violation\n", status);
+        ExFreePoolWithTag(ptr, tag);
+    }
+#endif
+#endif
+
+    ptr = pExAllocatePool2(POOL_FLAG_NON_PAGED, ~(SIZE_T)0, tag);
+    ok(!ptr, "Overflow-sized allocation unexpectedly succeeded (%p)\n", ptr);
+
+    /* The experimental NX arena is bounded. Exhaust it with a finite number
+     * of large requests, then free every block and prove allocation recovers. */
+    memset(blocks, 0, sizeof(blocks));
+    for (allocated = 0; allocated < ARRAY_SIZE(blocks); ++allocated)
+    {
+        blocks[allocated] = pExAllocatePool2(POOL_FLAG_NON_PAGED, 512 * 1024, tag);
+        if (!blocks[allocated]) break;
+    }
+    trace("Experimental NX-pool exhaustion threshold: attempted %u allocations of 512 KiB (64 MiB total).\n",
+            allocated);
+    ok(allocated < ARRAY_SIZE(blocks), "128 bounded 512-KiB allocations did not exhaust the arena\n");
+    for (i = 0; i < allocated; ++i) ExFreePoolWithTag(blocks[i], tag);
+    ptr = pExAllocatePool2(POOL_FLAG_NON_PAGED, 1024 * 1024, tag);
+    ok(!!ptr, "Pool did not coalesce and recover after bounded exhaustion\n");
+    if (ptr) ExFreePoolWithTag(ptr, tag);
+
+    workers = pExAllocatePool2(POOL_FLAG_NON_PAGED, 4 * sizeof(*workers), tag);
+    ok(!!workers, "Failed to allocate concurrent allocation contexts\n");
+    if (!workers) return;
+    memset(workers, 0, 4 * sizeof(*workers));
+    for (i = 0; i < 4; ++i)
+    {
+        KeInitializeEvent(&workers[i].done, NotificationEvent, FALSE);
+        workers[i].index = i;
+        threads[i] = create_rundown_thread(kernel_memory_worker, &workers[i]);
+    }
+    for (i = 0; i < 4; ++i)
+    {
+        if (!threads[i]) continue;
+        status = wait_single(&workers[i].done, -10000 * 10000);
+        ok(!status, "Pool allocation worker %u did not complete: %#lx\n", i, status);
+        if (status) driver_obj->DriverUnload = NULL;
+    }
+    for (i = 0; i < 4; ++i)
+    {
+        if (threads[i] && !join_rundown_thread(threads[i]))
+        {
+            driver_obj->DriverUnload = NULL;
+            workers_finished = FALSE;
+        }
+        if (threads[i] && !workers[i].failed) continue;
+        if (threads[i]) ok(!workers[i].failed, "Pool allocation worker %u observed data corruption or allocation failure\n", i);
+    }
+    if (workers_finished) ExFreePoolWithTag(workers, tag);
+    else trace("Retaining shared allocation worker state because a worker did not join.\n");
+}
+
 static void test_affinity(void)
 {
     KAFFINITY (WINAPI *pKeSetSystemAffinityThreadEx)(KAFFINITY affinity);
@@ -2659,6 +2985,93 @@ static void test_process_memory(const struct main_test_input *test_input)
         KeUnstackDetachProcess(&state);
     }
     ObDereferenceObject(process);
+}
+
+#if defined(__x86_64__) && defined(__WINE_PE_BUILD)
+/* Native x64 table-based SEH also works in an ordinary Windows kernel driver.
+ * Do not use Wine's TEB-based exception registration in this fixture. */
+LONG WINAPI attachment_exception_filter(EXCEPTION_POINTERS *exception, void *frame)
+{
+    return exception->ExceptionRecord->ExceptionCode == STATUS_ACCESS_VIOLATION
+            ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+NTSTATUS WINAPI attachment_read_byte(const volatile BYTE *address, BYTE *value);
+__ASM_GLOBAL_FUNC(attachment_read_byte,
+    "subq $40,%rsp\n\t"
+    ".seh_stackalloc 40\n\t"
+    ".seh_endprologue\n"
+    ".Lattachment_load_begin:\n\t"
+    "movzbl (%rcx),%eax\n"
+    ".Lattachment_load_end:\n\t"
+    "movb %al,(%rdx)\n\t"
+    "xorl %eax,%eax\n\t"
+    "addq $40,%rsp\n\t"
+    "ret\n"
+    ".Lattachment_recover:\n\t"
+    "movl $0xc0000005,%eax\n\t"
+    "addq $40,%rsp\n\t"
+    "ret\n\t"
+    ".seh_handler __C_specific_handler,@except\n\t"
+    ".seh_handlerdata\n\t"
+    ".long 1\n\t"
+    ".rva .Lattachment_load_begin,.Lattachment_load_end,attachment_exception_filter,.Lattachment_recover\n\t"
+    ".text");
+
+static void observe_attachment(const struct attachment_input *input,
+        struct attachment_observation *observation)
+{
+    observation->common_status = attachment_read_byte((void *)input->common_address,
+            &observation->common_value);
+    observation->target_status = attachment_read_byte((void *)input->target_address,
+            &observation->target_value);
+}
+#endif
+
+static NTSTATUS test_process_attachment(IRP *irp, IO_STACK_LOCATION *stack)
+{
+#if defined(__x86_64__) && defined(__WINE_PE_BUILD)
+    struct attachment_input input;
+    struct attachment_output output = {0};
+    PEPROCESS processes[2] = {NULL, NULL};
+    KAPC_STATE state_a, state_b;
+    BYTE value = 0x7e;
+    unsigned int i;
+
+    if (stack->Parameters.DeviceIoControl.InputBufferLength != sizeof(input)
+            || stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(output))
+        return STATUS_BUFFER_TOO_SMALL;
+    input = *(struct attachment_input *)irp->AssociatedIrp.SystemBuffer;
+    output.valid_status = attachment_read_byte(&value, &output.valid_value);
+    output.fault_status = attachment_read_byte(NULL, &value);
+    for (i = 0; i < 2; ++i)
+        output.lookup_status[i] = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)input.process_id[i],
+                &processes[i]);
+
+    if (!output.valid_status && output.valid_value == 0x7e
+            && output.fault_status == STATUS_ACCESS_VIOLATION
+            && !output.lookup_status[0] && !output.lookup_status[1])
+    {
+        observe_attachment(&input, &output.observations[0]);
+        KeStackAttachProcess((PKPROCESS)processes[0], &state_a);
+        observe_attachment(&input, &output.observations[1]);
+        KeStackAttachProcess((PKPROCESS)processes[1], &state_b);
+        observe_attachment(&input, &output.observations[2]);
+        KeUnstackDetachProcess(&state_b);
+        observe_attachment(&input, &output.observations[3]);
+        KeUnstackDetachProcess(&state_a);
+        observe_attachment(&input, &output.observations[4]);
+    }
+    /* No assertion, logging, allocation or I/O is performed while attached.
+     * Each guarded read returns normally even after an access violation. */
+    for (i = 0; i < 2; ++i)
+        if (processes[i]) ObDereferenceObject(processes[i]);
+    *(struct attachment_output *)irp->AssociatedIrp.SystemBuffer = output;
+    irp->IoStatus.Information = sizeof(output);
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
 }
 
 static void test_permanence(void)
@@ -3087,6 +3500,13 @@ static NTSTATUS WINAPI driver_IoControl(DEVICE_OBJECT *device, IRP *irp)
             break;
         case IOCTL_WINETEST_MAIN_TEST:
             status = main_test(device, irp, stack);
+            break;
+        case IOCTL_WINETEST_PROCESS_ATTACHMENT:
+            status = test_process_attachment(irp, stack);
+            break;
+        case IOCTL_WINETEST_SHARED_KERNEL_MEMORY:
+            test_shared_kernel_memory(irp, device);
+            status = STATUS_SUCCESS;
             break;
         case IOCTL_WINETEST_LOAD_DRIVER:
             status = test_load_driver_ioctl(irp, stack, &irp->IoStatus.Information);

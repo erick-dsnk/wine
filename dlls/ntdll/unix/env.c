@@ -1875,6 +1875,12 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
  */
 static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
 {
+    if (virtual_is_managed_executor() && main_image_info.Machine != IMAGE_FILE_MACHINE_AMD64)
+    {
+        MESSAGE( "wine: executor layout supports only AMD64 images\n" );
+        exit(1);
+    }
+
     peb->ImageBaseAddress           = module;
     peb->ProcessParameters          = params;
     peb->OSMajorVersion             = 10;

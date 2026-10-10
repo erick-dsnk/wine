@@ -4353,3 +4353,65 @@ enum fsync_type
     unsigned int shm_idx;
 @REPLY
 @END
+
+
+/* Internal, owner-only backing for experimental MEM_PRIVATE allocations.
+ * These objects cannot be mapped as sections. Foreign aliases are not admitted
+ * until there is a consumer revocation/acknowledgement protocol. */
+enum private_mapping_operation
+{
+    PRIVATE_MAPPING_PUBLISH = 1,
+    PRIVATE_MAPPING_COMMIT,
+    PRIVATE_MAPPING_PROTECT,
+    PRIVATE_MAPPING_DECOMMIT,
+    PRIVATE_MAPPING_RELEASE,
+    PRIVATE_MAPPING_RESET,
+};
+
+@REQ(create_private_mapping)
+    mem_size_t size;             /* backing extent */
+@REPLY
+    obj_handle_t handle;         /* owner-only backing handle, not a section */
+    unsigned __int64 generation;
+@END
+
+@REQ(begin_private_mapping_change)
+    obj_handle_t handle;
+    client_ptr_t base;           /* original owner allocation base */
+    mem_size_t offset;           /* affected offset in backing */
+    mem_size_t size;
+    unsigned __int64 generation; /* expected current generation */
+    unsigned int operation;     /* private_mapping_operation */
+@REPLY
+    unsigned __int64 generation; /* transaction token; backing is fenced */
+@END
+
+@REQ(finish_private_mapping_change)
+    obj_handle_t handle;
+    unsigned __int64 generation; /* transaction token */
+    int commit;                 /* local VM operation succeeded */
+@REPLY
+    unsigned __int64 generation; /* new generation, including on abort */
+@END
+
+@REQ(query_private_mapping)
+    obj_handle_t handle;
+@REPLY
+    client_ptr_t base;           /* original owner allocation, not a view lease */
+    mem_size_t size;             /* backing extent */
+    unsigned __int64 generation;
+    mem_size_t last_offset;      /* last completed change */
+    mem_size_t last_size;
+    unsigned int last_operation;
+    int updating;
+@END
+
+/* Deliberately unavailable until mapped aliases can be revoked. Checking a
+ * generation before a read cannot make a stale foreign mmap safe. */
+@REQ(acquire_private_mapping)
+    obj_handle_t process;
+    client_ptr_t address;
+    mem_size_t size;
+    unsigned int access;
+@REPLY
+@END

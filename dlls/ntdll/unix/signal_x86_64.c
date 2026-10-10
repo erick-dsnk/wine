@@ -3147,8 +3147,21 @@ void signal_init_process(void)
 
     /* sneak in a syscall dispatcher pointer at a fixed address (7ffe1000) */
     ptr = (char *)user_shared_data + page_size;
-    anon_mmap_fixed( ptr, page_size, PROT_READ | PROT_WRITE, 0 );
-    *(void **)ptr = __wine_syscall_dispatcher;
+    if (virtual_is_managed_executor())
+    {
+        NTSTATUS status = virtual_map_syscall_dispatcher( __wine_syscall_dispatcher );
+
+        if (status)
+        {
+            ERR( "failed to map the executor syscall dispatcher: %08x\n", status );
+            exit(1);
+        }
+    }
+    else
+    {
+        anon_mmap_fixed( ptr, page_size, PROT_READ | PROT_WRITE, 0 );
+        *(void **)ptr = __wine_syscall_dispatcher;
+    }
 
     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
 

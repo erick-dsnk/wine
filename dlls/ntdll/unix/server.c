@@ -108,7 +108,21 @@ sigset_t server_block_set;  /* signals to block during server calls */
 static int fd_socket = -1;  /* socket to exchange file descriptors with the server */
 static int initial_cwd = -1;
 static pid_t server_pid;
+#if defined(__linux__) && defined(__x86_64__)
+static __thread BOOL server_thread_initialized;
+#endif
 pthread_mutex_t fd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* This must be safe before the first TEB and its pthread key exist.  A thread
+ * can use owner-only private backing requests only after its server handshake. */
+BOOL server_thread_is_initialized(void)
+{
+#if defined(__linux__) && defined(__x86_64__)
+    return server_thread_initialized;
+#else
+    return FALSE;
+#endif
+}
 
 /* atomically exchange a 64-bit value */
 static inline LONG64 interlocked_xchg64( LONG64 *dest, LONG64 val )
@@ -1741,7 +1755,13 @@ size_t server_init_process(void)
     set_thread_id( NtCurrentTeb(), pid, tid );
 
     for (i = 0; i < supported_machines_count; i++)
-        if (supported_machines[i] == current_machine) return info_size;
+        if (supported_machines[i] == current_machine)
+        {
+#if defined(__linux__) && defined(__x86_64__)
+            server_thread_initialized = TRUE;
+#endif
+            return info_size;
+        }
 
     fatal_error( "wineserver doesn't support the %04x architecture\n", current_machine );
 }
@@ -1812,6 +1832,7 @@ void server_init_process_done(void)
 void server_init_thread( void *entry_point, BOOL *suspend )
 {
     void *teb;
+    unsigned int status;
     int reply_pipe = init_thread_pipe();
 
     /* always send the native TEB */
@@ -1824,11 +1845,17 @@ void server_init_thread( void *entry_point, BOOL *suspend )
         req->entry     = wine_server_client_ptr( entry_point );
         req->reply_fd  = reply_pipe;
         req->wait_fd   = ntdll_get_thread_data()->wait_fd[1];
-        wine_server_call( req );
+        status = wine_server_call( req );
         *suspend = reply->suspend;
     }
     SERVER_END_REQ;
     close( reply_pipe );
+    if (!status)
+    {
+#if defined(__linux__) && defined(__x86_64__)
+        server_thread_initialized = TRUE;
+#endif
+    }
 }
 
 NTSTATUS WINAPI NtAllocateReserveObject( HANDLE *handle, const OBJECT_ATTRIBUTES *attr,

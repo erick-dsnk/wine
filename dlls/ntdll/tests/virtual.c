@@ -19,12 +19,14 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "wine/test.h"
+#include "wine/managed_layout.h"
 #include "ddk/wdm.h"
 
 static unsigned int page_size;
@@ -52,6 +54,248 @@ static BOOL is_wow64;
 
 static SYSTEM_BASIC_INFORMATION sbi;
 
+static DWORD WINAPI managed_target_thread( void *arg )
+{
+    TEB *teb = NtCurrentTeb();
+    ULONG_PTR local = (ULONG_PTR)&teb;
+
+    ok( (ULONG_PTR)teb < WINE_MANAGED_GUEST_END, "target TEB outside guest: %p\n", teb );
+    ok( local < WINE_MANAGED_GUEST_END, "target Windows stack outside guest: %p\n", &teb );
+    return 0;
+}
+
+static void test_managed_target_layout( BOOL child )
+{
+    SYSTEM_BASIC_INFORMATION info;
+    SYSTEM_INFO system_info;
+    MEMORY_BASIC_INFORMATION mbi;
+    void *addr, *fixed, *saved;
+    SIZE_T size, result_size;
+    LARGE_INTEGER section_size;
+    HANDLE section = NULL, thread;
+    HMODULE module;
+    NTSTATUS status;
+    DWORD exit_code;
+    char setting[64], command[2 * MAX_PATH], **argv;
+    STARTUPINFOA si = {sizeof(si)};
+    PROCESS_INFORMATION pi;
+    NTSTATUS (WINAPI *set_unix_env)(const char *, const char *);
+    BOOL inject;
+
+    if (!child && (!GetEnvironmentVariableA( "WINE_MANAGED_LAYOUT", setting, sizeof(setting) ) ||
+                  strcmp( setting, WINE_MANAGED_LAYOUT_SETTING )))
+    {
+        skip( "managed target layout is not enabled\n" );
+        return;
+    }
+    if (!is_win64)
+    {
+        skip( "managed target layout requires AMD64\n" );
+        return;
+    }
+
+    status = NtQuerySystemInformation( SystemBasicInformation, &info, sizeof(info), NULL );
+    ok( !status, "basic information returned %08lx\n", status );
+    ok( (ULONG_PTR)info.HighestUserAddress == WINE_MANAGED_GUEST_END - 1,
+        "unexpected highest guest address %p\n", info.HighestUserAddress );
+    GetSystemInfo( &system_info );
+    ok( (ULONG_PTR)system_info.lpMaximumApplicationAddress == WINE_MANAGED_GUEST_END - 1,
+        "unexpected maximum application address %p\n", system_info.lpMaximumApplicationAddress );
+    trace( "managed target highest %p, TEB %p, PEB %p\n", info.HighestUserAddress,
+           NtCurrentTeb(), NtCurrentTeb()->Peb );
+    if (child) return;
+
+    addr = (void *)1;
+    size = 0x110000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( status == STATUS_INVALID_PARAMETER, "DOS allocation escaped guest minimum: %08lx\n", status );
+
+    addr = NULL;
+    size = 0x10000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size,
+                                      MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE );
+    ok( !status, "top-down allocation returned %08lx\n", status );
+    if (!status)
+    {
+        ok( (ULONG_PTR)addr + size <= WINE_MANAGED_GUEST_END, "top-down allocation escaped: %p\n", addr );
+        ok( (ULONG_PTR)addr >= WINE_MANAGED_GUEST_END - 0x10000000,
+            "top-down allocation did not reach the upper guest range: %p\n", addr );
+        trace( "legal upper guest Windows allocation %p, size %Ix\n", addr, size );
+        *(volatile BYTE *)addr = 0x5a;
+        saved = addr;
+        size = 0;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+        ok( !status, "release returned %08lx\n", status );
+        status = NtQueryVirtualMemory( NtCurrentProcess(), saved, MemoryBasicInformation,
+                                       &mbi, sizeof(mbi), &result_size );
+        ok( !status && mbi.State == MEM_FREE, "released guest state %08lx/%lx\n", status, mbi.State );
+        addr = saved;
+        size = 0x10000;
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size,
+                                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+        ok( !status && addr == saved, "reuse returned %08lx at %p\n", status, addr );
+        if (!status)
+        {
+            ok( *(volatile BYTE *)addr == 0, "reused guest memory is not zero\n" );
+            size = 0;
+            status = NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+            ok( !status, "reuse release returned %08lx\n", status );
+        }
+    }
+
+    fixed = (void *)(ULONG_PTR)(WINE_MANAGED_GUEST_END - 0x10000);
+    addr = fixed;
+    size = 0x10000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    if (status == STATUS_CONFLICTING_ADDRESSES)
+    {
+        status = NtQueryVirtualMemory( NtCurrentProcess(), fixed, MemoryBasicInformation,
+                                       &mbi, sizeof(mbi), &result_size );
+        ok( !status && mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE,
+            "last Windows allocation granule conflict has no image: %08lx/%lx/%lx\n",
+            status, mbi.State, mbi.Type );
+        trace( "terminal granule image allocation %p, region %p + %Ix, state %lx, type %lx\n",
+               mbi.AllocationBase, mbi.BaseAddress, mbi.RegionSize, mbi.State, mbi.Type );
+        status = NtQueryVirtualMemory( NtCurrentProcess(), (void *)(ULONG_PTR)(WINE_MANAGED_GUEST_END - 0x1000),
+                                       MemoryBasicInformation, &mbi, sizeof(mbi), &result_size );
+        ok( !status && (ULONG_PTR)mbi.BaseAddress < WINE_MANAGED_GUEST_END,
+            "last guest page query %08lx/%p\n", status, mbi.BaseAddress );
+        trace( "last Windows allocation granule contains a loaded PE image; final guest page state %lx\n", mbi.State );
+        status = STATUS_CONFLICTING_ADDRESSES;
+    }
+    else ok( !status && addr == fixed, "last legal allocation returned %08lx at %p\n", status, addr );
+    if (!status)
+    {
+        *((volatile BYTE *)addr + 0xffff) = 0xa5;
+        ok( *((volatile BYTE *)addr + 0xffff) == 0xa5, "last guest byte did not retain write\n" );
+        size = 0;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+        ok( !status, "last allocation release returned %08lx\n", status );
+    }
+    addr = fixed;
+    size = 0x20000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size, MEM_RESERVE, PAGE_NOACCESS );
+    ok( status == STATUS_INVALID_PARAMETER, "cross-boundary allocation returned %08lx\n", status );
+    addr = (void *)(ULONG_PTR)WINE_MANAGED_GUEST_END;
+    size = 0x1000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size, MEM_RESERVE, PAGE_NOACCESS );
+    ok( status == STATUS_INVALID_PARAMETER, "host-range allocation returned %08lx\n", status );
+
+    section_size.QuadPart = 0x10000;
+    status = NtCreateSection( &section, SECTION_ALL_ACCESS, NULL, &section_size,
+                              PAGE_READWRITE, SEC_COMMIT, NULL );
+    ok( !status, "section creation returned %08lx\n", status );
+    if (!status)
+    {
+        addr = (void *)(ULONG_PTR)WINE_MANAGED_GUEST_END;
+        size = 0x10000;
+        status = NtMapViewOfSection( section, NtCurrentProcess(), &addr, 0, 0, NULL, &size,
+                                     ViewUnmap, 0, PAGE_READWRITE );
+        ok( !NT_SUCCESS(status), "host-range section mapping returned %08lx at %p\n", status, addr );
+        if (NT_SUCCESS(status)) NtUnmapViewOfSection( NtCurrentProcess(), addr );
+        NtClose( section );
+    }
+
+    /* Cannot fit around this process's loaded PE images and thread state.
+     * Exercise the bounded retry after the first allocation search fails. */
+    addr = NULL;
+    size = (SIZE_T)(WINE_MANAGED_GUEST_END - WINE_MANAGED_GUEST_START);
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size, MEM_RESERVE, PAGE_NOACCESS );
+    ok( status == STATUS_NO_MEMORY, "exhausted guest search returned %08lx at %p\n", status, addr );
+    if (!status)
+    {
+        size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+    }
+
+    module = LoadLibraryA( "version.dll" );
+    ok( !!module && (ULONG_PTR)module < WINE_MANAGED_GUEST_END,
+        "ordinary PE load escaped guest: %p, error %lu\n", module, GetLastError() );
+    if (module) FreeLibrary( module );
+    if (GetEnvironmentVariableA( "WINE_MANAGED_LEGACY_TEST", setting, sizeof(setting) ))
+    {
+        module = LoadLibraryA( "managed_legacy.dll" );
+        ok( !module, "unsupported legacy .so builtin loaded at %p\n", module );
+        if (module) FreeLibrary( module );
+    }
+    thread = CreateThread( NULL, 0, managed_target_thread, NULL, 0, NULL );
+    ok( !!thread, "target thread creation failed %lu\n", GetLastError() );
+    if (thread)
+    {
+        ok( WaitForSingleObject( thread, 10000 ) == WAIT_OBJECT_0, "target thread did not return\n" );
+        CloseHandle( thread );
+    }
+
+    /* Windows environment edits cannot disable the admitted process contract. */
+    ok( SetEnvironmentVariableA( "WINE_MANAGED_LAYOUT", NULL ), "environment removal failed\n" );
+    GetSystemInfo( &system_info );
+    ok( (ULONG_PTR)system_info.lpMaximumApplicationAddress == WINE_MANAGED_GUEST_END - 1,
+        "environment removal changed admitted limit\n" );
+    winetest_get_mainargs( &argv );
+    snprintf( command, sizeof(command), "\"%s\" %s managed-layout-child", argv[0], argv[1] );
+    memset( &pi, 0, sizeof(pi) );
+    if (CreateProcessA( NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ))
+    {
+        ok( WaitForSingleObject( pi.hProcess, 10000 ) == WAIT_OBJECT_0, "managed child did not exit\n" );
+        GetExitCodeProcess( pi.hProcess, &exit_code );
+        ok( !exit_code, "managed child returned %lu\n", exit_code );
+        CloseHandle( pi.hThread );
+        CloseHandle( pi.hProcess );
+    }
+    else ok( FALSE, "managed child launch failed %lu\n", GetLastError() );
+
+    inject = GetEnvironmentVariableA( "WINE_MANAGED_INJECT_TEST", setting, sizeof(setting) );
+    if (inject)
+    {
+        set_unix_env = (void *)GetProcAddress( GetModuleHandleA("ntdll.dll"), "__wine_set_unix_env" );
+        ok( !!set_unix_env, "Wine Unix environment test hook is unavailable\n" );
+        if (!set_unix_env) return;
+        ok( !set_unix_env( "PROTON_MANAGED_FAIL_RESERVED", "1" ), "cannot enable reserved-map injection\n" );
+        addr = NULL;
+        size = 0x730000;
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size,
+                                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+        ok( status == STATUS_NO_MEMORY && !addr && size == 0x730000,
+            "reserved-map failure returned %08lx/%p/%Ix\n", status, addr, size );
+        if (!status)
+        {
+            size = 0;
+            NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+        }
+        ok( !set_unix_env( "PROTON_MANAGED_FAIL_RESERVED", NULL ), "cannot disable reserved-map injection\n" );
+        addr = NULL;
+        size = 0x730000;
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size,
+                                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+        ok( !status && (ULONG_PTR)addr + size <= WINE_MANAGED_GUEST_END,
+            "reserved-map retry returned %08lx/%p\n", status, addr );
+        if (!status)
+        {
+            *(volatile BYTE *)addr = 0x7b;
+            size = 0;
+            status = NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+            ok( !status, "reserved-map retry cleanup returned %08lx\n", status );
+        }
+        ok( !set_unix_env( "WINE_MANAGED_LAYOUT", NULL ), "cannot remove native layout setting for child test\n" );
+        ok( !set_unix_env( "PROTON_MANAGED_FAIL_CHILD_ENV", "1" ), "cannot enable child-env injection\n" );
+        memset( &pi, 0, sizeof(pi) );
+        SetLastError(0xdeadbeef);
+        if (CreateProcessA( NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ))
+        {
+            ok( FALSE, "child launched despite layout setenv failure\n" );
+            WaitForSingleObject( pi.hProcess, 10000 );
+            CloseHandle( pi.hThread );
+            CloseHandle( pi.hProcess );
+        }
+        /* spawn_process's grandchild exits 1 after exec_wineloader fails. */
+        else ok( GetLastError() == ERROR_WAIT_1, "child-env failure returned error %lu\n", GetLastError() );
+        ok( !set_unix_env( "PROTON_MANAGED_FAIL_CHILD_ENV", NULL ), "cannot disable child-env injection\n" );
+        ok( !set_unix_env( "WINE_MANAGED_LAYOUT", WINE_MANAGED_LAYOUT_SETTING ), "cannot restore native layout setting\n" );
+    }
+}
+
 static inline void *get_rva( HMODULE module, DWORD va )
 {
     return (void *)((char *)module + va);
@@ -61,7 +305,7 @@ static HANDLE create_target_process(const char *arg)
 {
     char **argv;
     char cmdline[MAX_PATH];
-    PROCESS_INFORMATION pi;
+    PROCESS_INFORMATION pi = { 0 };
     BOOL ret;
     STARTUPINFOA si = { 0 };
     si.cb = sizeof(si);
@@ -73,6 +317,23 @@ static HANDLE create_target_process(const char *arg)
     ret = CloseHandle(pi.hThread);
     ok(ret, "error %lu\n", GetLastError());
     return pi.hProcess;
+}
+
+static BOOL shared_private_backing_enabled(void)
+{
+    char value[8];
+    return GetEnvironmentVariableA("WINE_SHARED_PRIVATE_BACKING", value, sizeof(value)) == 1 && value[0] == '1';
+}
+
+static DWORD shared_private_backing_probe_hold(void)
+{
+    char value[16];
+    DWORD len = GetEnvironmentVariableA("WINE_SHARED_PRIVATE_BACKING_PROBE_HOLD_MS", value, sizeof(value));
+    unsigned long hold;
+
+    if (!len || len >= sizeof(value)) return 0;
+    hold = strtoul(value, NULL, 10);
+    return min(hold, 10000);
 }
 
 static UINT_PTR get_zero_bits(UINT_PTR p)
@@ -2593,6 +2854,732 @@ static void test_NtFreeVirtualMemory(void)
     ok(status == STATUS_SUCCESS, "Unexpected status %08lx.\n", status);
 }
 
+static void test_shared_private_backing_lifecycle(void)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    void *base = NULL, *addr;
+    SIZE_T size, query_size;
+    NTSTATUS status;
+    BOOL split = FALSE, left_live = FALSE, right_live = FALSE;
+    BYTE *bytes;
+    ULONG old_protect;
+
+    if (!shared_private_backing_enabled()) return;
+
+    size = page_size * 5;
+    status = NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size, MEM_RESERVE, PAGE_READWRITE);
+    ok(status == STATUS_SUCCESS, "reserve returned %08lx\n", status);
+    if (status) return;
+    ok(size == page_size * 5, "reserve size %Ix expected %Ix\n", size, page_size * 5);
+
+    memset(&mbi, 0, sizeof(mbi));
+    status = NtQueryVirtualMemory(NtCurrentProcess(), base, MemoryBasicInformation, &mbi, sizeof(mbi), &query_size);
+    ok(status == STATUS_SUCCESS, "query reserved page returned %08lx\n", status);
+    if (!status)
+    {
+        ok(mbi.AllocationBase == base, "allocation base %p expected %p\n", mbi.AllocationBase, base);
+        ok(mbi.State == MEM_RESERVE, "reserved page state %#lx\n", mbi.State);
+        ok(mbi.Type == MEM_PRIVATE, "reserved page type %#lx\n", mbi.Type);
+    }
+
+    /* Commit only the middle two pages; this exercises commitment within an existing backed reservation. */
+    addr = (char *)base + page_size;
+    size = page_size * 2;
+    status = NtAllocateVirtualMemory(NtCurrentProcess(), &addr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
+    ok(status == STATUS_SUCCESS, "partial commit returned %08lx\n", status);
+    if (status) goto release_whole;
+    ok(addr == (char *)base + page_size, "partial commit base %p\n", addr);
+    ok(size == page_size * 2, "partial commit size %Ix\n", size);
+    bytes = base;
+    ok(bytes[page_size + 37] == 0, "first committed page was not zero-filled\n");
+    ok(bytes[page_size * 2 + 37] == 0, "second committed page was not zero-filled\n");
+    bytes[page_size + 37] = 0x51;
+    bytes[page_size * 2 + 37] = 0x52;
+
+    memset(&mbi, 0, sizeof(mbi));
+    status = NtQueryVirtualMemory(NtCurrentProcess(), (char *)base + page_size, MemoryBasicInformation,
+                                  &mbi, sizeof(mbi), &query_size);
+    ok(status == STATUS_SUCCESS, "query first committed page returned %08lx\n", status);
+    if (!status)
+    {
+        ok(mbi.State == MEM_COMMIT, "first committed page state %#lx\n", mbi.State);
+        ok(mbi.Type == MEM_PRIVATE, "first committed page type %#lx\n", mbi.Type);
+        ok(mbi.Protect == PAGE_READWRITE, "first committed page protection %#lx\n", mbi.Protect);
+    }
+
+    addr = (char *)base + page_size * 2;
+    size = page_size;
+    status = NtProtectVirtualMemory(NtCurrentProcess(), &addr, &size, PAGE_READONLY, &old_protect);
+    ok(status == STATUS_SUCCESS, "protect second page returned %08lx\n", status);
+    if (!status) ok(old_protect == PAGE_READWRITE, "old protection %#lx\n", old_protect);
+    memset(&mbi, 0, sizeof(mbi));
+    status = NtQueryVirtualMemory(NtCurrentProcess(), (char *)base + page_size * 2,
+                                  MemoryBasicInformation, &mbi, sizeof(mbi), &query_size);
+    ok(status == STATUS_SUCCESS, "query read-only page returned %08lx\n", status);
+    if (!status)
+    {
+        ok(mbi.State == MEM_COMMIT, "read-only page state %#lx\n", mbi.State);
+        ok(mbi.Type == MEM_PRIVATE, "read-only page type %#lx\n", mbi.Type);
+        ok(mbi.Protect == PAGE_READONLY, "read-only page protection %#lx\n", mbi.Protect);
+    }
+
+    /* Decommit/recommit one page while the neighboring committed page keeps its data and protection. */
+    addr = (char *)base + page_size;
+    size = page_size;
+    status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_DECOMMIT);
+    ok(status == STATUS_SUCCESS, "partial decommit returned %08lx\n", status);
+    memset(&mbi, 0, sizeof(mbi));
+    status = NtQueryVirtualMemory(NtCurrentProcess(), (char *)base + page_size,
+                                  MemoryBasicInformation, &mbi, sizeof(mbi), &query_size);
+    ok(status == STATUS_SUCCESS, "query decommitted page returned %08lx\n", status);
+    if (!status)
+    {
+        ok(mbi.State == MEM_RESERVE, "decommitted page state %#lx\n", mbi.State);
+        ok(mbi.Type == MEM_PRIVATE, "decommitted page type %#lx\n", mbi.Type);
+    }
+    ok(bytes[page_size * 2 + 37] == 0x52, "neighbor data changed during decommit\n");
+
+    addr = (char *)base + page_size;
+    size = page_size;
+    status = NtAllocateVirtualMemory(NtCurrentProcess(), &addr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
+    ok(status == STATUS_SUCCESS, "recommit returned %08lx\n", status);
+    if (status) goto release_whole;
+    ok(bytes[page_size + 37] == 0, "recommitted page was not zero-filled\n");
+    ok(bytes[page_size * 2 + 37] == 0x52, "neighbor data changed across recommit\n");
+    bytes[page_size + 37] = 0x51;
+
+    /* Release one committed page, splitting the reservation into two independently mutable siblings. */
+    addr = (char *)base + page_size * 2;
+    size = page_size;
+    status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_RELEASE);
+    ok(status == STATUS_SUCCESS, "partial release returned %08lx\n", status);
+    if (status) goto release_whole;
+    split = TRUE;
+    left_live = right_live = TRUE;
+    ok(size == page_size, "partial release size %Ix\n", size);
+
+    memset(&mbi, 0, sizeof(mbi));
+    status = NtQueryVirtualMemory(NtCurrentProcess(), (char *)base + page_size * 2,
+                                  MemoryBasicInformation, &mbi, sizeof(mbi), &query_size);
+    ok(status == STATUS_SUCCESS, "query released middle page returned %08lx\n", status);
+    if (!status) ok(mbi.State == MEM_FREE, "released middle page state %#lx\n", mbi.State);
+
+    /* Commit, decommit and recommit pages on both sides of the released hole. */
+    addr = base;
+    size = page_size;
+    status = NtAllocateVirtualMemory(NtCurrentProcess(), &addr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
+    ok(status == STATUS_SUCCESS, "left sibling commit returned %08lx\n", status);
+    if (status) goto release_siblings;
+    bytes[37] = 0x50;
+    addr = (char *)base + page_size * 3;
+    size = page_size;
+    status = NtAllocateVirtualMemory(NtCurrentProcess(), &addr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
+    ok(status == STATUS_SUCCESS, "right sibling commit returned %08lx\n", status);
+    if (status) goto release_siblings;
+    bytes[page_size * 3 + 37] = 0x53;
+
+    addr = base;
+    size = page_size;
+    status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_DECOMMIT);
+    ok(status == STATUS_SUCCESS, "left sibling decommit returned %08lx\n", status);
+    addr = (char *)base + page_size * 3;
+    size = page_size;
+    status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_DECOMMIT);
+    ok(status == STATUS_SUCCESS, "right sibling decommit returned %08lx\n", status);
+
+    addr = base;
+    size = page_size;
+    status = NtAllocateVirtualMemory(NtCurrentProcess(), &addr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
+    ok(status == STATUS_SUCCESS, "left sibling recommit returned %08lx\n", status);
+    if (!status) ok(bytes[37] == 0, "left sibling recommit was not zero-filled\n");
+    addr = (char *)base + page_size * 3;
+    size = page_size;
+    status = NtAllocateVirtualMemory(NtCurrentProcess(), &addr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
+    ok(status == STATUS_SUCCESS, "right sibling recommit returned %08lx\n", status);
+    if (!status) ok(bytes[page_size * 3 + 37] == 0, "right sibling recommit was not zero-filled\n");
+    ok(bytes[page_size + 37] == 0x51, "left sibling data changed across right-side operations\n");
+
+release_siblings:
+    if (left_live)
+    {
+        addr = base;
+        size = 0;
+        status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_RELEASE);
+        ok(status == STATUS_SUCCESS, "left sibling release returned %08lx\n", status);
+        if (status)
+        {
+            addr = base;
+            size = 0;
+            status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_RELEASE);
+            ok(status == STATUS_SUCCESS, "retry left sibling release returned %08lx\n", status);
+        }
+        left_live = !!status;
+    }
+    if (right_live)
+    {
+        addr = (char *)base + page_size * 3;
+        size = 0;
+        status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_RELEASE);
+        ok(status == STATUS_SUCCESS, "right sibling release returned %08lx\n", status);
+        if (status)
+        {
+            addr = (char *)base + page_size * 3;
+            size = 0;
+            status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_RELEASE);
+            ok(status == STATUS_SUCCESS, "retry right sibling release returned %08lx\n", status);
+        }
+        right_live = !!status;
+    }
+    if (!left_live && !right_live)
+    {
+        MEMORY_BASIC_INFORMATION left_mbi, right_mbi;
+        status = NtQueryVirtualMemory(NtCurrentProcess(), base, MemoryBasicInformation,
+                                      &left_mbi, sizeof(left_mbi), &query_size);
+        ok(status == STATUS_SUCCESS, "query released left sibling returned %08lx\n", status);
+        if (!status) ok(left_mbi.State == MEM_FREE, "left sibling state after release %#lx\n", left_mbi.State);
+        status = NtQueryVirtualMemory(NtCurrentProcess(), (char *)base + page_size * 4,
+                                      MemoryBasicInformation, &right_mbi, sizeof(right_mbi), &query_size);
+        ok(status == STATUS_SUCCESS, "query released right sibling returned %08lx\n", status);
+        if (!status) ok(right_mbi.State == MEM_FREE, "right sibling state after release %#lx\n", right_mbi.State);
+        status = NtQueryVirtualMemory(NtCurrentProcess(), (char *)base + page_size * 2,
+                                      MemoryBasicInformation, &right_mbi, sizeof(right_mbi), &query_size);
+        ok(status == STATUS_SUCCESS, "query released hole returned %08lx\n", status);
+        if (!status) ok(right_mbi.State == MEM_FREE, "released hole state after cleanup %#lx\n", right_mbi.State);
+    }
+    if (left_live || right_live) return;
+    return;
+
+release_whole:
+    if (split) goto release_siblings;
+    size = 0;
+    status = NtFreeVirtualMemory(NtCurrentProcess(), &base, &size, MEM_RELEASE);
+    ok(status == STATUS_SUCCESS, "fallback reservation release returned %08lx\n", status);
+}
+
+static void test_shared_private_backing_child(void)
+{
+    HANDLE process = NULL, ready_event = NULL, release_event = NULL;
+    char ready_name[64], release_name[64], arg[160];
+    void *base = NULL, *remote_base;
+    void *candidates[16] = { 0 };
+    MEMORY_BASIC_INFORMATION mbi;
+    SIZE_T size, remote_size, bytes_read;
+    NTSTATUS status;
+    DWORD exit_code, wait_status;
+    BYTE local_byte, remote_byte;
+    unsigned int attempt, candidate_count = 0, i;
+    BOOL common_found = FALSE;
+    HANDLE wait_handles[2];
+
+    if (!shared_private_backing_enabled()) return;
+
+    sprintf(ready_name, "wine_shared_private_backing_%08lx_ready", GetCurrentProcessId());
+    sprintf(release_name, "wine_shared_private_backing_%08lx_release", GetCurrentProcessId());
+    ready_event = CreateEventA(NULL, TRUE, FALSE, ready_name);
+    release_event = CreateEventA(NULL, TRUE, FALSE, release_name);
+    ok(ready_event != NULL, "failed to create ready event: %lu\n", GetLastError());
+    ok(release_event != NULL, "failed to create release event: %lu\n", GetLastError());
+    if (!ready_event || !release_event) goto done;
+
+    sprintf(arg, "vm-backing-child %s %s", ready_name, release_name);
+    process = create_target_process(arg);
+    ok(process != NULL, "failed to start backing child\n");
+    if (!process) goto done;
+
+    wait_handles[0] = ready_event;
+    wait_handles[1] = process;
+    wait_status = WaitForMultipleObjects(ARRAY_SIZE(wait_handles), wait_handles, FALSE, 10000);
+    ok(wait_status == WAIT_OBJECT_0, "child ready wait returned %#lx\n", wait_status);
+    if (wait_status != WAIT_OBJECT_0) goto terminate_child;
+
+    /* Keep each local candidate reserved until the child accepts one, so collisions cannot repeat. */
+    for (attempt = 0; attempt < 16; attempt++)
+    {
+        base = NULL;
+        size = page_size * 2;
+        status = NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size,
+                                         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        ok(status == STATUS_SUCCESS, "local candidate allocation returned %08lx\n", status);
+        if (status) goto terminate_child;
+        candidates[candidate_count++] = base;
+        base = NULL;
+
+        remote_base = candidates[candidate_count - 1];
+        remote_size = page_size * 2;
+        status = NtAllocateVirtualMemory(process, &remote_base, 0, &remote_size,
+                                         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (status == STATUS_SUCCESS)
+        {
+            ok(remote_base == candidates[candidate_count - 1], "child allocation base %p differs from requested %p\n",
+               remote_base, candidates[candidate_count - 1]);
+            if (remote_base != candidates[candidate_count - 1])
+            {
+                size = 0;
+                NtFreeVirtualMemory(process, &remote_base, &size, MEM_RELEASE);
+                goto terminate_child;
+            }
+            base = remote_base;
+            candidates[candidate_count - 1] = NULL;
+            common_found = TRUE;
+            break;
+        }
+        if (status != STATUS_CONFLICTING_ADDRESSES && status != STATUS_NO_MEMORY)
+        {
+            ok(0, "child same-address allocation returned unexpected %08lx\n", status);
+            goto terminate_child;
+        }
+    }
+    ok(common_found, "could not find a common free address after %u distinct candidates\n", candidate_count);
+    for (i = 0; i < candidate_count; i++)
+    {
+        if (!candidates[i]) continue;
+        size = 0;
+        status = NtFreeVirtualMemory(NtCurrentProcess(), &candidates[i], &size, MEM_RELEASE);
+        ok(status == STATUS_SUCCESS, "discard local candidate %u returned %08lx\n", i, status);
+        candidates[i] = NULL;
+    }
+    if (!common_found) goto terminate_child;
+    ok(base == remote_base, "local base %p differs from child base %p\n", base, remote_base);
+
+    local_byte = 0x59;
+    *(volatile BYTE *)base = local_byte;
+    remote_byte = 0xa7;
+    status = WriteProcessMemory(process, remote_base, &remote_byte, sizeof(remote_byte), &bytes_read);
+    ok(status, "WriteProcessMemory to child failed: %lu\n", GetLastError());
+    ok(bytes_read == sizeof(remote_byte), "wrote %Ix bytes to child\n", bytes_read);
+    ok(*(volatile BYTE *)base == local_byte, "child write changed caller's same-VA allocation\n");
+
+    bytes_read = 0;
+    status = ReadProcessMemory(process, remote_base, &local_byte, sizeof(local_byte), &bytes_read);
+    ok(status, "ReadProcessMemory from child failed: %lu\n", GetLastError());
+    ok(bytes_read == sizeof(local_byte), "read %Ix bytes from child\n", bytes_read);
+    ok(local_byte == remote_byte, "child byte %#x expected %#x\n", local_byte, remote_byte);
+
+    memset(&mbi, 0, sizeof(mbi));
+    status = NtQueryVirtualMemory(process, remote_base, MemoryBasicInformation, &mbi, sizeof(mbi), &bytes_read);
+    ok(status == STATUS_SUCCESS, "query child private page returned %08lx\n", status);
+    if (!status)
+    {
+        ok(mbi.AllocationBase == remote_base, "child allocation base %p expected %p\n", mbi.AllocationBase, remote_base);
+        ok(mbi.State == MEM_COMMIT, "child page state %#lx\n", mbi.State);
+        ok(mbi.Type == MEM_PRIVATE, "child page type %#lx\n", mbi.Type);
+        ok(mbi.Protect == PAGE_READWRITE, "child page protection %#lx\n", mbi.Protect);
+    }
+
+    trace("shared_private_backing_probe state=resident parent_pid=%lu child_pid=%lu base=%p size=%Ix\n",
+          GetCurrentProcessId(), GetProcessId(process), remote_base, remote_size);
+    {
+        DWORD hold = shared_private_backing_probe_hold();
+        if (hold) Sleep(hold);
+    }
+    ok(SetEvent(release_event), "failed to signal child release event: %lu\n", GetLastError());
+    wait_status = WaitForSingleObject(process, 10000);
+    ok(wait_status == WAIT_OBJECT_0, "child exit wait returned %#lx\n", wait_status);
+    if (wait_status == WAIT_OBJECT_0)
+    {
+        BOOL got_exit_code;
+        exit_code = ~0u;
+        got_exit_code = GetExitCodeProcess(process, &exit_code);
+        ok(got_exit_code, "GetExitCodeProcess failed: %lu\n", GetLastError());
+        ok(exit_code == 0, "child exited with %lu\n", exit_code);
+        trace("shared_private_backing_probe state=free owner=child parent_state=resident parent_pid=%lu child_pid=%lu base=%p size=%Ix exit=%lu\n",
+              GetCurrentProcessId(), GetProcessId(process), remote_base, remote_size, exit_code);
+    }
+    else
+    {
+        TerminateProcess(process, 1);
+        WaitForSingleObject(process, 10000);
+    }
+
+    size = 0;
+    status = NtFreeVirtualMemory(NtCurrentProcess(), &base, &size, MEM_RELEASE);
+    ok(status == STATUS_SUCCESS, "local shared-address release returned %08lx\n", status);
+    if (!status)
+    {
+        memset(&mbi, 0, sizeof(mbi));
+        status = NtQueryVirtualMemory(NtCurrentProcess(), base, MemoryBasicInformation, &mbi, sizeof(mbi), &bytes_read);
+        ok(status == STATUS_SUCCESS, "query released caller page returned %08lx\n", status);
+        if (!status) ok(mbi.State == MEM_FREE, "caller page state after release %#lx\n", mbi.State);
+    }
+    goto done;
+
+terminate_child:
+    if (process)
+    {
+        SetEvent(release_event);
+        if (WaitForSingleObject(process, 1000) != WAIT_OBJECT_0)
+        {
+            TerminateProcess(process, 1);
+            WaitForSingleObject(process, 10000);
+        }
+    }
+    if (base)
+    {
+        size = 0;
+        NtFreeVirtualMemory(NtCurrentProcess(), &base, &size, MEM_RELEASE);
+    }
+    for (i = 0; i < candidate_count; i++)
+    {
+        if (!candidates[i]) continue;
+        size = 0;
+        NtFreeVirtualMemory(NtCurrentProcess(), &candidates[i], &size, MEM_RELEASE);
+        candidates[i] = NULL;
+    }
+done:
+    if (process) CloseHandle(process);
+    if (ready_event) CloseHandle(ready_event);
+    if (release_event) CloseHandle(release_event);
+}
+
+static void test_shared_private_backing_failure(void)
+{
+    char failure_case[32], base_string[32], *end;
+    MEMORY_BASIC_INFORMATION mbi;
+    void *base, *addr;
+    SIZE_T size, returned_size;
+    NTSTATUS status;
+    ULONGLONG base_value;
+    BYTE *bytes;
+    ULONG old_protect;
+    DWORD len;
+
+    if (!shared_private_backing_enabled()) return;
+    if (!is_win64) return;
+    len = GetEnvironmentVariableA("PROTON_VM_FAIL_CASE", failure_case, sizeof(failure_case));
+    if (!len) return;
+    if (len >= sizeof(failure_case))
+    {
+        ok(0, "PROTON_VM_FAIL_CASE is too long\n");
+        return;
+    }
+    if (!strcmp(failure_case, "fatal-protect") || !strcmp(failure_case, "fatal-decommit"))
+    {
+        char arg[96];
+        HANDLE process;
+        DWORD wait_status, exit_code = ~0u;
+
+        len = GetEnvironmentVariableA("PROTON_VM_FAIL_BASE", base_string, sizeof(base_string));
+        if (!len || len >= sizeof(base_string))
+        {
+            ok(0, "fatal rollback test requires PROTON_VM_FAIL_BASE\n");
+            return;
+        }
+        base_value = strtoull(base_string, &end, 0);
+        if (!base_value || *end || (base_value & 0xffff))
+        {
+            ok(0, "invalid PROTON_VM_FAIL_BASE %s\n", base_string);
+            return;
+        }
+        sprintf(arg, "vm-backing-fatal %s %s", failure_case + 6, base_string);
+        process = create_target_process(arg);
+        ok(process != NULL, "failed to start fatal rollback child\n");
+        if (!process) return;
+        wait_status = WaitForSingleObject(process, 10000);
+        ok(wait_status == WAIT_OBJECT_0, "fatal rollback child wait returned %#lx\n", wait_status);
+        if (wait_status != WAIT_OBJECT_0)
+        {
+            TerminateProcess(process, 1);
+            WaitForSingleObject(process, 10000);
+        }
+        else
+        {
+            BOOL got_exit_code = GetExitCodeProcess(process, &exit_code);
+            ok(got_exit_code, "GetExitCodeProcess failed: %lu\n", GetLastError());
+            ok(exit_code == STATUS_UNSUCCESSFUL, "fatal rollback child exited %08lx\n", exit_code);
+            trace("private_backing_failure case=%s stage=child_exit status=%08lx\n", failure_case, exit_code);
+        }
+        CloseHandle(process);
+        return;
+    }
+    len = GetEnvironmentVariableA("PROTON_VM_FAIL_BASE", base_string, sizeof(base_string));
+    if (!len || len >= sizeof(base_string))
+    {
+        ok(0, "PROTON_VM_FAIL_CASE requires PROTON_VM_FAIL_BASE\n");
+        return;
+    }
+
+    base_value = strtoull(base_string, &end, 0);
+    if (!base_value || *end || (base_value & 0xffff))
+    {
+        ok(0, "invalid PROTON_VM_FAIL_BASE %s\n", base_string);
+        return;
+    }
+    base = (void *)(ULONG_PTR)base_value;
+    trace("private_backing_failure case=%s stage=begin base=%p size=0x9000\n", failure_case, base);
+
+    if (!strcmp(failure_case, "map"))
+    {
+        size = 0x9000;
+        status = NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size,
+                                         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        trace("private_backing_failure case=map stage=first status=%08lx\n", status);
+        ok(status == STATUS_NO_MEMORY, "injected allocation returned %08lx\n", status);
+        ok(base == (void *)(ULONG_PTR)base_value, "failed allocation changed base to %p\n", base);
+        ok(size == 0x9000, "failed allocation changed size to %Ix\n", size);
+        if (status == STATUS_SUCCESS)
+        {
+            size = 0;
+            NtFreeVirtualMemory(NtCurrentProcess(), &base, &size, MEM_RELEASE);
+            return;
+        }
+
+        memset(&mbi, 0, sizeof(mbi));
+        returned_size = VirtualQuery((void *)(ULONG_PTR)base_value, &mbi, sizeof(mbi));
+        ok(returned_size == sizeof(mbi), "query failed allocation returned %Ix\n", returned_size);
+        if (returned_size) ok(mbi.State == MEM_FREE, "failed allocation state %#lx\n", mbi.State);
+
+        base = (void *)(ULONG_PTR)base_value;
+        size = 0x9000;
+        status = NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size,
+                                         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        trace("private_backing_failure case=map stage=retry status=%08lx\n", status);
+        ok(status == STATUS_SUCCESS, "retry allocation returned %08lx\n", status);
+        if (status) return;
+        bytes = base;
+        ok(bytes[0] == 0 && bytes[0x1000] == 0 && bytes[0x8000] == 0,
+           "retried allocation was not zero-filled\n");
+        size = 0;
+        status = NtFreeVirtualMemory(NtCurrentProcess(), &base, &size, MEM_RELEASE);
+        ok(status == STATUS_SUCCESS, "retry allocation release returned %08lx\n", status);
+        memset(&mbi, 0, sizeof(mbi));
+        returned_size = VirtualQuery((void *)(ULONG_PTR)base_value, &mbi, sizeof(mbi));
+        ok(returned_size == sizeof(mbi), "query released retry allocation returned %Ix\n", returned_size);
+        if (returned_size) ok(mbi.State == MEM_FREE, "released retry allocation state %#lx\n", mbi.State);
+        return;
+    }
+
+    if (!strcmp(failure_case, "exec"))
+    {
+        static const BYTE code[] = { 0xb8, 42, 0, 0, 0, 0xc3 }; /* mov eax,42; ret */
+        int (__cdecl *probe)(void);
+        int result;
+
+        size = 0x9000;
+        status = NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size,
+                                         MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        trace("private_backing_failure case=exec stage=first status=%08lx\n", status);
+        ok(status == STATUS_ACCESS_DENIED, "injected executable allocation returned %08lx\n", status);
+        ok(base == (void *)(ULONG_PTR)base_value, "failed executable allocation changed base to %p\n", base);
+        ok(size == 0x9000, "failed executable allocation changed size to %Ix\n", size);
+        if (status == STATUS_SUCCESS)
+        {
+            size = 0;
+            NtFreeVirtualMemory(NtCurrentProcess(), &base, &size, MEM_RELEASE);
+            return;
+        }
+
+        memset(&mbi, 0, sizeof(mbi));
+        returned_size = VirtualQuery((void *)(ULONG_PTR)base_value, &mbi, sizeof(mbi));
+        ok(returned_size == sizeof(mbi), "query failed executable allocation returned %Ix\n", returned_size);
+        if (returned_size) ok(mbi.State == MEM_FREE, "failed executable allocation state %#lx\n", mbi.State);
+
+        base = (void *)(ULONG_PTR)base_value;
+        size = 0x9000;
+        status = NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size,
+                                         MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        trace("private_backing_failure case=exec stage=retry status=%08lx\n", status);
+        ok(status == STATUS_SUCCESS, "executable allocation retry returned %08lx\n", status);
+        if (status) return;
+        memset(&mbi, 0, sizeof(mbi));
+        status = NtQueryVirtualMemory(NtCurrentProcess(), base, MemoryBasicInformation,
+                                      &mbi, sizeof(mbi), &returned_size);
+        ok(status == STATUS_SUCCESS, "query retried executable allocation returned %08lx\n", status);
+        if (!status)
+        {
+            ok(mbi.State == MEM_COMMIT, "executable page state %#lx\n", mbi.State);
+            ok(mbi.Type == MEM_PRIVATE, "executable page type %#lx\n", mbi.Type);
+            ok(mbi.Protect == PAGE_EXECUTE_READWRITE, "executable page protection %#lx\n", mbi.Protect);
+        }
+        memcpy(base, code, sizeof(code));
+        FlushInstructionCache(GetCurrentProcess(), base, sizeof(code));
+        probe = (void *)base;
+        result = probe();
+        ok(result == 42, "executable backing probe returned %d\n", result);
+        size = 0;
+        status = NtFreeVirtualMemory(NtCurrentProcess(), &base, &size, MEM_RELEASE);
+        ok(status == STATUS_SUCCESS, "executable allocation release returned %08lx\n", status);
+        memset(&mbi, 0, sizeof(mbi));
+        returned_size = VirtualQuery((void *)(ULONG_PTR)base_value, &mbi, sizeof(mbi));
+        ok(returned_size == sizeof(mbi), "query released executable allocation returned %Ix\n", returned_size);
+        if (returned_size) ok(mbi.State == MEM_FREE, "released executable allocation state %#lx\n", mbi.State);
+        return;
+    }
+
+    if (strcmp(failure_case, "protect") && strcmp(failure_case, "decommit"))
+    {
+        ok(0, "unknown PROTON_VM_FAIL_CASE %s\n", failure_case);
+        return;
+    }
+
+    size = 0x9000;
+    status = NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size,
+                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ok(status == STATUS_SUCCESS, "fixture allocation returned %08lx\n", status);
+    if (status) return;
+    bytes = base;
+
+    if (!strcmp(failure_case, "protect"))
+    {
+        bytes[0x101] = 0x10;
+        bytes[0x3101] = 0x30;
+        bytes[0x6101] = 0x60;
+        addr = (char *)base + 0x3000;
+        size = 0x3000;
+        status = NtProtectVirtualMemory(NtCurrentProcess(), &addr, &size, PAGE_READONLY, &old_protect);
+        ok(status == STATUS_SUCCESS, "setup middle read-only segment returned %08lx\n", status);
+        if (status) goto release_failure_fixture;
+        ok(old_protect == PAGE_READWRITE, "setup old protection %#lx\n", old_protect);
+
+        addr = base;
+        size = 0x9000;
+        status = NtProtectVirtualMemory(NtCurrentProcess(), &addr, &size, PAGE_READONLY, &old_protect);
+        trace("private_backing_failure case=protect stage=first status=%08lx\n", status);
+        ok(status == STATUS_ACCESS_DENIED, "injected protect returned %08lx\n", status);
+        if (status == STATUS_ACCESS_DENIED)
+        {
+            static const ULONG offsets[] = { 0, 0x3000, 0x6000 };
+            static const ULONG protections[] = { PAGE_READWRITE, PAGE_READONLY, PAGE_READWRITE };
+            unsigned int i;
+            for (i = 0; i < ARRAY_SIZE(offsets); i++)
+            {
+                memset(&mbi, 0, sizeof(mbi));
+                status = NtQueryVirtualMemory(NtCurrentProcess(), (char *)base + offsets[i],
+                                              MemoryBasicInformation, &mbi, sizeof(mbi), &returned_size);
+                ok(status == STATUS_SUCCESS, "query rollback segment %u returned %08lx\n", i, status);
+                if (!status)
+                {
+                    ok(mbi.State == MEM_COMMIT, "rollback segment %u state %#lx\n", i, mbi.State);
+                    ok(mbi.Type == MEM_PRIVATE, "rollback segment %u type %#lx\n", i, mbi.Type);
+                    ok(mbi.Protect == protections[i], "rollback segment %u protection %#lx expected %#lx\n",
+                       i, mbi.Protect, protections[i]);
+                }
+            }
+            ok(bytes[0x101] == 0x10 && bytes[0x3101] == 0x30 && bytes[0x6101] == 0x60,
+               "protect rollback changed fixture bytes\n");
+
+            addr = base;
+            size = 0x9000;
+            status = NtProtectVirtualMemory(NtCurrentProcess(), &addr, &size, PAGE_READONLY, &old_protect);
+            trace("private_backing_failure case=protect stage=retry status=%08lx\n", status);
+            ok(status == STATUS_SUCCESS, "protect retry returned %08lx\n", status);
+            if (!status)
+            {
+                memset(&mbi, 0, sizeof(mbi));
+                status = NtQueryVirtualMemory(NtCurrentProcess(), (char *)base + 0x6000,
+                                              MemoryBasicInformation, &mbi, sizeof(mbi), &returned_size);
+                ok(status == STATUS_SUCCESS, "query retried protect returned %08lx\n", status);
+                if (!status) ok(mbi.Protect == PAGE_READONLY, "retried protection %#lx\n", mbi.Protect);
+                ok(bytes[0x101] == 0x10 && bytes[0x3101] == 0x30 && bytes[0x6101] == 0x60,
+                   "protect retry changed fixture bytes\n");
+            }
+        }
+    }
+    else
+    {
+        bytes[0x101] = 0x10;
+        bytes[0x1101] = 0x21;
+        bytes[0x2101] = 0x32;
+        addr = (char *)base + 0x1000;
+        size = 0x1000;
+        status = NtProtectVirtualMemory(NtCurrentProcess(), &addr, &size, PAGE_READONLY, &old_protect);
+        ok(status == STATUS_SUCCESS, "setup decommit read-only page returned %08lx\n", status);
+        if (status) goto release_failure_fixture;
+        ok(old_protect == PAGE_READWRITE, "decommit setup old protection %#lx\n", old_protect);
+        addr = (char *)base + 0x1000;
+        size = 0x1000;
+        status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_DECOMMIT);
+        trace("private_backing_failure case=decommit stage=first status=%08lx\n", status);
+        ok(status == STATUS_NOT_SUPPORTED, "injected decommit returned %08lx\n", status);
+        if (status == STATUS_NOT_SUPPORTED)
+        {
+            memset(&mbi, 0, sizeof(mbi));
+            status = NtQueryVirtualMemory(NtCurrentProcess(), (char *)base + 0x1000,
+                                          MemoryBasicInformation, &mbi, sizeof(mbi), &returned_size);
+            ok(status == STATUS_SUCCESS, "query failed decommit returned %08lx\n", status);
+            if (!status)
+            {
+                ok(mbi.State == MEM_COMMIT, "failed decommit page state %#lx\n", mbi.State);
+                ok(mbi.Type == MEM_PRIVATE, "failed decommit page type %#lx\n", mbi.Type);
+                ok(mbi.Protect == PAGE_READONLY, "failed decommit page protection %#lx\n", mbi.Protect);
+            }
+            ok(bytes[0x101] == 0x10 && bytes[0x1101] == 0x21 && bytes[0x2101] == 0x32,
+               "failed decommit changed page contents\n");
+
+            addr = (char *)base + 0x1000;
+            size = 0x1000;
+            status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_DECOMMIT);
+            trace("private_backing_failure case=decommit stage=retry status=%08lx\n", status);
+            ok(status == STATUS_SUCCESS, "decommit retry returned %08lx\n", status);
+            if (!status)
+            {
+                status = NtQueryVirtualMemory(NtCurrentProcess(), (char *)base + 0x1000,
+                                              MemoryBasicInformation, &mbi, sizeof(mbi), &returned_size);
+                ok(status == STATUS_SUCCESS, "query retried decommit returned %08lx\n", status);
+                if (!status) ok(mbi.State == MEM_RESERVE, "retried decommit state %#lx\n", mbi.State);
+                addr = (char *)base + 0x1000;
+                size = 0x1000;
+                status = NtAllocateVirtualMemory(NtCurrentProcess(), &addr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
+                ok(status == STATUS_SUCCESS, "decommit recommit returned %08lx\n", status);
+                if (!status)
+                {
+                    ok(bytes[0x1101] == 0, "recommitted decommit page was not zero-filled\n");
+                    ok(bytes[0x101] == 0x10 && bytes[0x2101] == 0x32,
+                       "decommit retry changed neighboring data\n");
+                }
+            }
+        }
+    }
+
+release_failure_fixture:
+    size = 0;
+    status = NtFreeVirtualMemory(NtCurrentProcess(), &base, &size, MEM_RELEASE);
+    ok(status == STATUS_SUCCESS, "failure fixture release returned %08lx\n", status);
+    memset(&mbi, 0, sizeof(mbi));
+    returned_size = VirtualQuery((void *)(ULONG_PTR)base_value, &mbi, sizeof(mbi));
+    ok(returned_size == sizeof(mbi), "query released failure fixture returned %Ix\n", returned_size);
+    if (returned_size) ok(mbi.State == MEM_FREE, "released failure fixture state %#lx\n", mbi.State);
+}
+
+static void run_shared_private_backing_fatal(const char *failure_case, const char *base_string)
+{
+    void *base = (void *)(ULONG_PTR)strtoull(base_string, NULL, 0), *addr;
+    SIZE_T size = 0x9000;
+    NTSTATUS status;
+    ULONG old_protect;
+
+    trace("private_backing_failure case=fatal-%s stage=begin base=%p size=0x9000\n", failure_case, base);
+    status = NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size,
+                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (status)
+    {
+        trace("private_backing_failure case=fatal-%s stage=allocation_returned status=%08lx\n", failure_case, status);
+        return;
+    }
+    if (!strcmp(failure_case, "protect"))
+    {
+        addr = (char *)base + 0x3000;
+        size = 0x3000;
+        status = NtProtectVirtualMemory(NtCurrentProcess(), &addr, &size, PAGE_READONLY, &old_protect);
+        if (!status)
+        {
+            addr = base;
+            size = 0x9000;
+            status = NtProtectVirtualMemory(NtCurrentProcess(), &addr, &size, PAGE_READONLY, &old_protect);
+        }
+    }
+    else
+    {
+        addr = (char *)base + 0x1000;
+        size = 0x1000;
+        status = NtProtectVirtualMemory(NtCurrentProcess(), &addr, &size, PAGE_READONLY, &old_protect);
+        if (status) return;
+        addr = (char *)base + 0x1000;
+        size = 0x1000;
+        status = NtFreeVirtualMemory(NtCurrentProcess(), &addr, &size, MEM_DECOMMIT);
+    }
+    trace("private_backing_failure case=fatal-%s stage=operation_returned status=%08lx\n", failure_case, status);
+}
+
 static void test_NtProtectVirtualMemory(void)
 {
     void *addr, *addr2;
@@ -3533,9 +4520,32 @@ START_TEST(virtual)
 
     if (argc >= 3)
     {
+        if (!strcmp(argv[2], "managed-layout") || !strcmp(argv[2], "managed-layout-child"))
+        {
+            test_managed_target_layout( !strcmp(argv[2], "managed-layout-child") );
+            return;
+        }
         if (!strcmp(argv[2], "sleep"))
         {
             Sleep(5000); /* spawned process runs for at most 5 seconds */
+            return;
+        }
+        if (!strcmp(argv[2], "vm-backing-child") && argc >= 5)
+        {
+            HANDLE ready_event = OpenEventA(EVENT_MODIFY_STATE, FALSE, argv[3]);
+            HANDLE release_event = OpenEventA(SYNCHRONIZE, FALSE, argv[4]);
+
+            if (!ready_event || !release_event) ExitProcess(2);
+            if (!SetEvent(ready_event)) ExitProcess(3);
+            if (WaitForSingleObject(release_event, 30000) != WAIT_OBJECT_0) ExitProcess(4);
+            CloseHandle(ready_event);
+            CloseHandle(release_event);
+            return;
+        }
+        if (!strcmp(argv[2], "vm-backing-fatal") && argc >= 5)
+        {
+            if (strcmp(argv[3], "protect") && strcmp(argv[3], "decommit")) ExitProcess(5);
+            run_shared_private_backing_fatal(argv[3], argv[4]);
             return;
         }
         return;
@@ -3565,6 +4575,9 @@ START_TEST(virtual)
     test_NtAllocateVirtualMemoryEx();
     test_NtAllocateVirtualMemoryEx_address_requirements();
     test_NtFreeVirtualMemory();
+    test_shared_private_backing_lifecycle();
+    test_shared_private_backing_child();
+    test_shared_private_backing_failure();
     test_NtProtectVirtualMemory();
     test_RtlCreateUserStack();
     test_NtMapViewOfSection();

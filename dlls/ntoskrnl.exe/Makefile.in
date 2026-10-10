@@ -5,6 +5,7 @@ DELAYIMPORTS = rpcrt4 setupapi
 
 SOURCES = \
 	instr.c \
+	kernel_memory.c \
 	ntoskrnl.c \
 	ntoskrnl.rc \
 	plugplay.idl \

@@ -146,17 +146,37 @@ struct object_header
     POBJECT_TYPE type;
 };
 
+static void *alloc_kernel_buffer( SIZE_T size, BOOL zero )
+{
+    if (kernel_memory_init()) return NULL;
+    if (kernel_memory_enabled())
+        return kernel_memory_alloc( max( size, 1 ), MEMORY_ALLOCATION_ALIGNMENT, FALSE, zero, 0 );
+    return HeapAlloc( GetProcessHeap(), zero ? HEAP_ZERO_MEMORY : 0, size );
+}
+
+static void free_kernel_buffer( void *ptr )
+{
+    if (!ptr) return;
+    if (kernel_memory_enabled())
+    {
+        if (!kernel_memory_free( ptr )) ERR( "foreign kernel buffer %p\n", ptr );
+    }
+    else
+        HeapFree( GetProcessHeap(), 0, ptr );
+}
+
 static void free_kernel_object( void *obj )
 {
     struct object_header *header = (struct object_header *)obj - 1;
-    HeapFree( GetProcessHeap(), 0, header );
+    free_kernel_buffer( header );
 }
 
 void *alloc_kernel_object( POBJECT_TYPE type, HANDLE handle, SIZE_T size, LONG ref )
 {
     struct object_header *header;
 
-    if (!(header = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*header) + size)) )
+    if (size > ~(SIZE_T)0 - sizeof(*header)) return NULL;
+    if (!(header = alloc_kernel_buffer( sizeof(*header) + size, TRUE )))
         return NULL;
 
     if (handle)
@@ -430,11 +450,12 @@ static void free_dispatch_irp( struct irp_data *irp_data )
 
     if (irp->UserBuffer != irp->AssociatedIrp.SystemBuffer)
     {
-        HeapFree( GetProcessHeap(), 0, irp->UserBuffer );
+        free_kernel_buffer( irp->UserBuffer );
         irp->UserBuffer = NULL;
     }
 
-    free( irp_data );
+    if (kernel_memory_enabled()) kernel_memory_free( irp_data );
+    else free( irp_data );
 }
 
 static ULONG get_irp_output_size( IRP *irp )
@@ -518,8 +539,17 @@ static NTSTATUS dispatch_irp( DEVICE_OBJECT *device, IRP *irp, struct dispatch_c
     LARGE_INTEGER count;
     NTSTATUS status;
 
-    if (!(irp_data = malloc( sizeof(*irp_data) )))
+    irp_data = kernel_memory_enabled() ? alloc_kernel_buffer( sizeof(*irp_data), FALSE )
+                                      : malloc( sizeof(*irp_data) );
+    if (!irp_data)
+    {
+        if (irp->UserBuffer != irp->AssociatedIrp.SystemBuffer)
+            free_kernel_buffer( irp->UserBuffer );
+        if (irp->Flags & IRP_DEALLOCATE_BUFFER)
+            free_kernel_buffer( irp->AssociatedIrp.SystemBuffer );
+        IoFreeIrp( irp );
         return STATUS_NO_MEMORY;
+    }
     irp_data->handle = context->handle;
     irp_data->irp = irp;
     irp_data->async = FALSE;
@@ -639,14 +669,14 @@ static NTSTATUS dispatch_read( struct dispatch_context *context )
 
     TRACE( "device %p file %p size %lu\n", device, file, out_size );
 
-    if (!(out_buff = HeapAlloc( GetProcessHeap(), 0, out_size ))) return STATUS_NO_MEMORY;
+    if (!(out_buff = alloc_kernel_buffer( out_size, FALSE ))) return STATUS_NO_MEMORY;
 
     offset.QuadPart = context->params.read.pos;
 
     if (!(irp = IoBuildSynchronousFsdRequest( IRP_MJ_READ, device, out_buff, out_size,
                                               &offset, NULL, NULL )))
     {
-        HeapFree( GetProcessHeap(), 0, out_buff );
+        free_kernel_buffer( out_buff );
         return STATUS_NO_MEMORY;
     }
 
@@ -748,12 +778,12 @@ static NTSTATUS dispatch_ioctl( struct dispatch_context *context )
         {
             if (context->in_size < out_size) return STATUS_INVALID_DEVICE_REQUEST;
             context->in_size -= out_size;
-            if (!(out_buff = HeapAlloc( GetProcessHeap(), 0, out_size ))) return STATUS_NO_MEMORY;
+            if (!(out_buff = alloc_kernel_buffer( out_size, FALSE ))) return STATUS_NO_MEMORY;
             memcpy( out_buff, (char *)context->in_buff + context->in_size, out_size );
         }
         else if (out_size > context->in_size)
         {
-            if (!(out_buff = HeapAlloc( GetProcessHeap(), 0, out_size ))) return STATUS_NO_MEMORY;
+            if (!(out_buff = alloc_kernel_buffer( out_size, FALSE ))) return STATUS_NO_MEMORY;
             memcpy( out_buff, context->in_buff, context->in_size );
             to_free = context->in_buff;
             context->in_buff = out_buff;
@@ -766,11 +796,13 @@ static NTSTATUS dispatch_ioctl( struct dispatch_context *context )
                                          context->in_size, out_buff, out_size, FALSE, NULL, NULL );
     if (!irp)
     {
-        HeapFree( GetProcessHeap(), 0, out_buff );
+        /* Keep the request context as the sole owner of its input allocation. */
+        if (out_buff != context->in_buff) free_kernel_buffer( out_buff );
+        free_kernel_buffer( to_free );
         return STATUS_NO_MEMORY;
     }
 
-    if (out_size && (context->params.ioctl.code & 3) != METHOD_BUFFERED)
+    if (!kernel_memory_enabled() && out_size && (context->params.ioctl.code & 3) != METHOD_BUFFERED)
         HeapReAlloc( GetProcessHeap(), HEAP_REALLOC_IN_PLACE_ONLY, context->in_buff, context->in_size );
 
     irpsp = IoGetNextIrpStackLocation( irp );
@@ -784,7 +816,7 @@ static NTSTATUS dispatch_ioctl( struct dispatch_context *context )
     irp->Flags |= IRP_DEALLOCATE_BUFFER;  /* deallocate in_buff */
     status = dispatch_irp( device, irp, context );
 
-    HeapFree( GetProcessHeap(), 0, to_free );
+    free_kernel_buffer( to_free );
     return status;
 }
 
@@ -805,12 +837,12 @@ static NTSTATUS dispatch_volume( struct dispatch_context *context )
     TRACE( "class 0x%x device %p file %p in_size %lu out_size %lu\n",
            context->params.volume.info_class, device, file, context->in_size, out_size );
 
-    if (!(out_buff = HeapAlloc( GetProcessHeap(), 0, out_size ))) return STATUS_NO_MEMORY;
+    if (!(out_buff = alloc_kernel_buffer( out_size, FALSE ))) return STATUS_NO_MEMORY;
 
     irp = IoAllocateIrp( device->StackSize, FALSE );
     if (!irp)
     {
-        HeapFree( GetProcessHeap(), 0, out_buff );
+        free_kernel_buffer( out_buff );
         return STATUS_NO_MEMORY;
     }
 
@@ -930,6 +962,8 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
     struct wine_driver *driver;
     HANDLE handles[2];
 
+    if ((status = kernel_memory_init())) return status;
+
     /* Set the system process global before setting up the request thread trickery  */
     PsInitialSystemProcess = IoGetCurrentProcess();
     request_thread = GetCurrentThreadId();
@@ -942,7 +976,7 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
     for (;;)
     {
         NtCurrentTeb()->Instrumentation[1] = NULL;
-        if (!context.in_buff && !(context.in_buff = HeapAlloc( GetProcessHeap(), 0, context.in_size )))
+        if (!context.in_buff && !(context.in_buff = alloc_kernel_buffer( context.in_size, FALSE )))
         {
             ERR( "failed to allocate buffer\n" );
             status = STATUS_NO_MEMORY;
@@ -1029,7 +1063,7 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
             if (!context.in_buff) context.in_size = 4096;
             break;
         case STATUS_BUFFER_OVERFLOW:
-            HeapFree( GetProcessHeap(), 0, context.in_buff );
+            free_kernel_buffer( context.in_buff );
             context.in_buff = NULL;
             /* restart with larger buffer */
             break;
@@ -1039,7 +1073,8 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
                 DWORD ret = WaitForMultipleObjectsEx( 2, handles, FALSE, INFINITE, TRUE );
                 if (ret == WAIT_OBJECT_0)
                 {
-                    HeapFree( GetProcessHeap(), 0, context.in_buff );
+                    free_kernel_buffer( context.in_buff );
+                    context.in_buff = NULL;
                     status = STATUS_SUCCESS;
                     goto done;
                 }
@@ -1050,6 +1085,7 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
     }
 
 done:
+    free_kernel_buffer( context.in_buff );
     /* Native PnP drivers expect that all of their devices will be removed when
      * their unload routine is called. Moreover, we cannot unload a module
      * until we have removed devices for all lower drivers, so we have to stop
@@ -1218,7 +1254,7 @@ PMDL WINAPI IoAllocateMdl( PVOID va, ULONG length, BOOLEAN secondary, BOOLEAN ch
         FIXME("Charge quota is not yet supported\n");
 
     mdl_size = sizeof(MDL) + sizeof(PFN_NUMBER) * ADDRESS_AND_SIZE_TO_SPAN_PAGES(va, length);
-    mdl = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, mdl_size );
+    mdl = alloc_kernel_buffer( mdl_size, TRUE );
     if (!mdl)
         return NULL;
 
@@ -1247,7 +1283,7 @@ PMDL WINAPI IoAllocateMdl( PVOID va, ULONG length, BOOLEAN secondary, BOOLEAN ch
 void WINAPI IoFreeMdl(PMDL mdl)
 {
     TRACE("%p\n", mdl);
-    HeapFree(GetProcessHeap(), 0, mdl);
+    free_kernel_buffer( mdl );
 }
 
 
@@ -1541,6 +1577,8 @@ NTSTATUS WINAPI IoCreateDriver( UNICODE_STRING *name, PDRIVER_INITIALIZE init )
     unsigned int i;
 
     TRACE("(%s, %p)\n", debugstr_us(name), init);
+
+    if ((status = kernel_memory_init())) return status;
 
     if (!(driver = alloc_kernel_object( IoDriverObjectType, NULL, sizeof(*driver), 1 )))
         return STATUS_NO_MEMORY;
@@ -2088,7 +2126,7 @@ VOID WINAPI IoCompleteRequest( IRP *irp, UCHAR priority_boost )
     }
 
     if (irp->Flags & IRP_DEALLOCATE_BUFFER)
-        HeapFree( GetProcessHeap(), 0, irp->AssociatedIrp.SystemBuffer );
+        free_kernel_buffer( irp->AssociatedIrp.SystemBuffer );
     if (irp->UserIosb) *irp->UserIosb = irp->IoStatus;
     if (irp->UserEvent) KeSetEvent( irp->UserEvent, IO_NO_INCREMENT, FALSE );
 
@@ -2214,26 +2252,67 @@ __ASM_FASTCALL_FUNC(RtlUlonglongByteSwap, 8,
 /***********************************************************************
  *           ExAllocatePool2   (NTOSKRNL.EXE.@)
  */
-void * WINAPI ExAllocatePool2( POOL_FLAGS flags, SIZE_T size, ULONG tag )
+static void *allocate_pool( POOL_FLAGS flags, SIZE_T size, ULONG tag, BOOL legacy )
 {
-    /* FIXME: handle page alignment constraints */
-    void *ret = HeapAlloc( ntoskrnl_heap, 0, size );
+    const POOL_FLAGS memory_flags = POOL_FLAG_NON_PAGED | POOL_FLAG_NON_PAGED_EXECUTE | POOL_FLAG_PAGED;
+    const POOL_FLAGS supported_flags = memory_flags | POOL_FLAG_UNINITIALIZED
+            | POOL_FLAG_CACHE_ALIGNED | POOL_FLAG_RAISE_ON_FAILURE;
+    POOL_FLAGS memory_type = flags & memory_flags;
+    NTSTATUS status = kernel_memory_init();
+    SIZE_T alignment = MEMORY_ALLOCATION_ALIGNMENT;
+    void *ret = NULL;
+
+    if (!kernel_memory_enabled())
+    {
+        /* Preserve the existing default path; only the explicit experiment
+         * adopts the new shared allocator and its flag/alignment contracts. */
+        ret = HeapAlloc( ntoskrnl_heap, 0, size );
+    }
+    else
+    {
+        if (!status)
+        {
+            if (!size || (!legacy && !tag) || !memory_type || (memory_type & (memory_type - 1))
+                    || ((flags & 0xffffffff) & ~supported_flags))
+                status = STATUS_INVALID_PARAMETER;
+            else
+            {
+                if (flags & POOL_FLAG_CACHE_ALIGNED) alignment = 64;
+                ret = kernel_memory_alloc( size, alignment, memory_type == POOL_FLAG_NON_PAGED_EXECUTE,
+                                           !(flags & POOL_FLAG_UNINITIALIZED), tag );
+                if (!ret) status = STATUS_INSUFFICIENT_RESOURCES;
+            }
+        }
+        if (!ret && (flags & POOL_FLAG_RAISE_ON_FAILURE)) RtlRaiseStatus( status );
+    }
     TRACE( "(0x%I64x, %Iu, %s) -> %p\n", flags, size, debugstr_fourcc(tag), ret );
     return ret;
 }
 
+void * WINAPI ExAllocatePool2( POOL_FLAGS flags, SIZE_T size, ULONG tag )
+{
+    return allocate_pool( flags, size, tag, FALSE );
+}
+
 static POOL_FLAGS pool_type_to_flags( POOL_TYPE type )
 {
+    BOOL enabled = kernel_memory_enabled();
+    BOOL nx = (type & POOL_NX_ALLOCATION) || !enabled;
+
+    if (enabled && (type & ~(7 | POOL_QUOTA_FAIL_INSTEAD_OF_RAISE | POOL_RAISE_IF_ALLOCATION_FAILURE
+                            | POOL_COLD_ALLOCATION | POOL_NX_ALLOCATION)))
+        return 0;
+
     switch (type & 7)
     {
     case NonPagedPool:
     case NonPagedPoolMustSucceed:
-        return POOL_FLAG_NON_PAGED;
+        return nx ? POOL_FLAG_NON_PAGED : POOL_FLAG_NON_PAGED_EXECUTE;
     case PagedPool:
         return POOL_FLAG_PAGED;
     case NonPagedPoolCacheAligned:
     case NonPagedPoolCacheAlignedMustS:
-        return POOL_FLAG_NON_PAGED|POOL_FLAG_CACHE_ALIGNED;
+        return (nx ? POOL_FLAG_NON_PAGED : POOL_FLAG_NON_PAGED_EXECUTE) | POOL_FLAG_CACHE_ALIGNED;
     case PagedPoolCacheAligned:
         return POOL_FLAG_PAGED|POOL_FLAG_CACHE_ALIGNED;
     default:
@@ -2250,7 +2329,7 @@ PVOID WINAPI ExAllocatePool( POOL_TYPE type, SIZE_T size )
     if (type & POOL_RAISE_IF_ALLOCATION_FAILURE)
         flags |= POOL_FLAG_RAISE_ON_FAILURE;
 
-    return ExAllocatePool2( flags, size, 0 );
+    return allocate_pool( flags | POOL_FLAG_UNINITIALIZED, size, 0, TRUE );
 }
 
 /***********************************************************************
@@ -2262,7 +2341,7 @@ PVOID WINAPI ExAllocatePoolWithQuota( POOL_TYPE type, SIZE_T size )
     if (!(type & POOL_QUOTA_FAIL_INSTEAD_OF_RAISE))
         flags |= POOL_FLAG_RAISE_ON_FAILURE;
 
-    return ExAllocatePool2( flags, size, 0 );
+    return allocate_pool( flags | POOL_FLAG_UNINITIALIZED, size, 0, TRUE );
 }
 
 /***********************************************************************
@@ -2274,7 +2353,7 @@ PVOID WINAPI ExAllocatePoolWithTag( POOL_TYPE type, SIZE_T size, ULONG tag )
     if (type & POOL_RAISE_IF_ALLOCATION_FAILURE)
         flags |= POOL_FLAG_RAISE_ON_FAILURE;
 
-    return ExAllocatePool2( flags, size, tag );
+    return allocate_pool( flags | POOL_FLAG_UNINITIALIZED, size, tag, TRUE );
 }
 
 /***********************************************************************
@@ -2286,7 +2365,7 @@ PVOID WINAPI ExAllocatePoolWithQuotaTag( POOL_TYPE type, SIZE_T size, ULONG tag 
     if (!(type & POOL_QUOTA_FAIL_INSTEAD_OF_RAISE))
         flags |= POOL_FLAG_RAISE_ON_FAILURE;
 
-    return ExAllocatePool2( flags, size, tag );
+    return allocate_pool( flags | POOL_FLAG_UNINITIALIZED, size, tag, TRUE );
 }
 
 /***********************************************************************
@@ -2337,7 +2416,12 @@ void WINAPI ExFreePool( void *ptr )
 void WINAPI ExFreePoolWithTag( void *ptr, ULONG tag )
 {
     TRACE( "%p\n", ptr );
-    HeapFree( ntoskrnl_heap, 0, ptr );
+    if (kernel_memory_enabled())
+    {
+        if (ptr && !kernel_memory_free( ptr )) ERR( "foreign pool allocation %p\n", ptr );
+    }
+    else
+        HeapFree( ntoskrnl_heap, 0, ptr );
 }
 
 static void initialize_lookaside_list( GENERAL_LOOKASIDE *lookaside, PALLOCATE_FUNCTION allocate, PFREE_FUNCTION free,
@@ -4107,6 +4191,8 @@ NTSTATUS WINAPI ZwLoadDriver( const UNICODE_STRING *service_name )
     NTSTATUS status;
 
     TRACE( "(%s)\n", debugstr_us(service_name) );
+
+    if ((status = kernel_memory_init())) return status;
 
     if ((status = open_driver( service_name, (SC_HANDLE *)&service_handle )) != STATUS_SUCCESS)
         return status;

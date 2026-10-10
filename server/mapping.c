@@ -217,6 +217,49 @@ static const struct fd_ops mapping_fd_ops =
     default_fd_reselect_async     /* reselect_async */
 };
 
+/* A backing capability is deliberately a different object from a section.
+ * Even the owner cannot use NtMapViewOfSection on it to manufacture an
+ * untracked alias. The fd is only used by the owner's VM implementation. */
+struct private_mapping
+{
+    struct object obj;
+    struct mapping *mapping;
+    struct process *owner;
+    client_ptr_t base, pending_base;
+    mem_size_t offset, size, pending_offset, pending_size;
+    unsigned __int64 generation;
+    unsigned int operation, pending_operation;
+};
+
+static void private_mapping_dump( struct object *obj, int verbose );
+static struct fd *private_mapping_get_fd( struct object *obj );
+static void private_mapping_destroy( struct object *obj );
+
+static const struct object_ops private_mapping_ops =
+{
+    sizeof(struct private_mapping), /* size */
+    &no_type,                      /* type */
+    private_mapping_dump,          /* dump */
+    no_add_queue,                  /* add_queue */
+    NULL,                          /* remove_queue */
+    NULL,                          /* signaled */
+    NULL,                          /* satisfied */
+    no_signal,                     /* signal */
+    private_mapping_get_fd,        /* get_fd */
+    default_get_sync,              /* get_sync */
+    default_map_access,            /* map_access */
+    default_get_sd,                /* get_sd */
+    default_set_sd,                /* set_sd */
+    no_get_full_name,              /* get_full_name */
+    no_lookup_name,                /* lookup_name */
+    no_link_name,                  /* link_name */
+    NULL,                          /* unlink_name */
+    no_open_file,                  /* open_file */
+    no_kernel_obj_list,            /* get_kernel_obj_list */
+    no_close_handle,               /* close_handle */
+    private_mapping_destroy        /* destroy */
+};
+
 /* free address ranges for PE image mappings */
 struct addr_range
 {
@@ -1300,6 +1343,163 @@ static void mapping_destroy( struct object *obj )
 static enum server_fd_type mapping_get_fd_type( struct fd *fd )
 {
     return FD_TYPE_FILE;
+}
+
+static void private_mapping_dump( struct object *obj, int verbose )
+{
+    struct private_mapping *mapping = (struct private_mapping *)obj;
+
+    fprintf( stderr, "Private backing owner=%p base=%08x%08x generation=%08x%08x\n", mapping->owner,
+             (unsigned int)(mapping->base >> 32), (unsigned int)mapping->base,
+             (unsigned int)(mapping->generation >> 32), (unsigned int)mapping->generation );
+}
+
+static struct fd *private_mapping_get_fd( struct object *obj )
+{
+    struct private_mapping *mapping = (struct private_mapping *)obj;
+
+    if (mapping->owner != current->process)
+    {
+        set_error( STATUS_NOT_SUPPORTED );
+        return NULL;
+    }
+    return get_obj_fd( &mapping->mapping->obj );
+}
+
+static void private_mapping_destroy( struct object *obj )
+{
+    struct private_mapping *mapping = (struct private_mapping *)obj;
+
+    if (mapping->mapping) release_object( mapping->mapping );
+    if (mapping->owner) release_object( mapping->owner );
+}
+
+static struct private_mapping *get_private_mapping_obj( obj_handle_t handle )
+{
+    struct private_mapping *mapping;
+
+    if (!(mapping = (struct private_mapping *)get_handle_obj( current->process, handle, 0,
+                                                              &private_mapping_ops ))) return NULL;
+    if (mapping->owner != current->process)
+    {
+        set_error( STATUS_NOT_SUPPORTED );
+        release_object( mapping );
+        return NULL;
+    }
+    return mapping;
+}
+
+DECL_HANDLER(create_private_mapping)
+{
+    const struct unicode_str name = { NULL, 0 };
+    struct private_mapping *mapping;
+
+    if (!req->size || (req->size & page_mask) || req->size >> 54)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (!(mapping = alloc_object( &private_mapping_ops ))) return;
+    mapping->mapping = NULL;
+    mapping->owner = NULL;
+    mapping->base = mapping->pending_base = 0;
+    mapping->offset = mapping->size = mapping->pending_offset = mapping->pending_size = 0;
+    mapping->operation = mapping->pending_operation = 0;
+    mapping->generation = 1;
+    if ((mapping->mapping = create_mapping( NULL, &name, 0, req->size, SEC_COMMIT, 0, 0, NULL )))
+    {
+        mapping->owner = (struct process *)grab_object( current->process );
+        reply->handle = alloc_handle_no_access_check( current->process, &mapping->obj, 0, 0 );
+        reply->generation = mapping->generation;
+    }
+    release_object( mapping );
+}
+
+/* No consumer may observe a backing during a VM mutation. There are no
+ * admitted consumers yet; the fence is groundwork for a revoke/ack protocol,
+ * not an implementation of that protocol. Both completion and abort advance
+ * the epoch so a token is never reused. */
+DECL_HANDLER(begin_private_mapping_change)
+{
+    struct private_mapping *mapping;
+
+    if (!(mapping = get_private_mapping_obj( req->handle ))) return;
+    if (mapping->pending_operation) set_error( STATUS_DEVICE_BUSY );
+    else if (mapping->generation != req->generation) set_error( STATUS_INVALID_PARAMETER );
+    else if (mapping->generation >= ~(unsigned __int64)0 - 1) set_error( STATUS_INTEGER_OVERFLOW );
+    else if (!req->size || (req->base & page_mask) || (req->offset & page_mask) || (req->size & page_mask)
+             || req->base + mapping->mapping->size < req->base
+             || req->offset >= mapping->mapping->size || req->size > mapping->mapping->size - req->offset
+             || req->operation < PRIVATE_MAPPING_PUBLISH || req->operation > PRIVATE_MAPPING_RESET
+             || (req->operation == PRIVATE_MAPPING_PUBLISH
+                 ? mapping->base || !req->base || req->offset || req->size != mapping->mapping->size
+                 : !mapping->base || req->base != mapping->base))
+        set_error( STATUS_INVALID_PARAMETER );
+    else
+    {
+        mapping->pending_base = req->base;
+        mapping->pending_offset = req->offset;
+        mapping->pending_size = req->size;
+        mapping->pending_operation = req->operation;
+        reply->generation = ++mapping->generation;
+    }
+    release_object( mapping );
+}
+
+DECL_HANDLER(finish_private_mapping_change)
+{
+    struct private_mapping *mapping;
+
+    if (!(mapping = get_private_mapping_obj( req->handle ))) return;
+    if (!mapping->pending_operation || mapping->generation != req->generation)
+        set_error( STATUS_INVALID_PARAMETER );
+    else
+    {
+        if (req->commit)
+        {
+            mapping->base = mapping->pending_base;
+            mapping->offset = mapping->pending_offset;
+            mapping->size = mapping->pending_size;
+            mapping->operation = mapping->pending_operation;
+        }
+        mapping->pending_operation = 0;
+        reply->generation = ++mapping->generation;
+    }
+    release_object( mapping );
+}
+
+DECL_HANDLER(query_private_mapping)
+{
+    struct private_mapping *mapping;
+
+    if (!(mapping = get_private_mapping_obj( req->handle ))) return;
+    reply->base = mapping->base;
+    reply->size = mapping->mapping->size;
+    reply->generation = mapping->generation;
+    reply->last_offset = mapping->offset;
+    reply->last_size = mapping->size;
+    reply->last_operation = mapping->operation;
+    reply->updating = !!mapping->pending_operation;
+    release_object( mapping );
+}
+
+DECL_HANDLER(acquire_private_mapping)
+{
+    struct process *process;
+    unsigned int access = PROCESS_VM_READ;
+
+    if (req->access & ~(FILE_READ_DATA | FILE_WRITE_DATA) || !(req->access & FILE_READ_DATA)
+        || !req->size || req->address + req->size < req->address)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (req->access & FILE_WRITE_DATA) access |= PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+    if (!(process = get_process_from_handle( req->process, access ))) return;
+    /* An fd, even read-only, would permit stale access after protect/decommit
+     * or process exit. No fd or mapping capability is returned. */
+    set_error( STATUS_NOT_SUPPORTED );
+    release_object( process );
 }
 
 /* assign a mapping address to a PE image mapping */

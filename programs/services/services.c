@@ -1038,6 +1038,7 @@ found:
         static const WCHAR *preserve[] =
         {
             L"WINEBOOTSTRAPMODE",
+            L"WINE_SHARED_KERNEL_MEMORY",
             L"PROTON_DISABLE_HIDRAW",
             L"PROTON_ENABLE_HIDRAW",
             L"FEX_APP_DATA_LOCATION",
@@ -1046,15 +1047,17 @@ found:
         };
         WCHAR buffer[1024];
 
-        CreateEnvironmentBlock(&environment, token, FALSE);
-        for (size_t i = 0; i < ARRAY_SIZE(preserve); i++)
+        if (CreateEnvironmentBlock(&environment, token, FALSE))
         {
-            if (GetEnvironmentVariableW( preserve[i], buffer, ARRAY_SIZE(buffer) ))
+            for (size_t i = 0; i < ARRAY_SIZE(preserve); i++)
             {
-                UNICODE_STRING value, name;
-                RtlInitUnicodeString( &name, preserve[i] );
-                RtlInitUnicodeString( &value, buffer );
-                RtlSetEnvironmentVariable( (WCHAR **)&environment, &name, &value );
+                if (GetEnvironmentVariableW( preserve[i], buffer, ARRAY_SIZE(buffer) ))
+                {
+                    UNICODE_STRING value, name;
+                    RtlInitUnicodeString( &name, preserve[i] );
+                    RtlInitUnicodeString( &value, buffer );
+                    RtlSetEnvironmentVariable( (WCHAR **)&environment, &name, &value );
+                }
             }
         }
         CloseHandle(token);

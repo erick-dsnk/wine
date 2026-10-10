@@ -91,6 +91,7 @@
 #undef _r_debug
 
 #include "wine/asm.h"
+#include "wine/managed_layout.h"
 #include "main.h"
 
 #pragma GCC visibility push(hidden)
@@ -107,6 +108,27 @@
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
 #endif
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+static int managed_role;
+static const struct wine_managed_layout managed_target_layout =
+{
+    WINE_MANAGED_LAYOUT_VERSION, WINE_MANAGED_LAYOUT_TARGET,
+    WINE_MANAGED_GUEST_START, WINE_MANAGED_GUEST_END
+};
+
+static const struct wine_managed_executor_layout managed_executor_layout =
+{
+    { WINE_MANAGED_EXECUTOR_VERSION, WINE_MANAGED_LAYOUT_EXECUTOR,
+      WINE_MANAGED_GUEST_START, WINE_MANAGED_GUEST_END },
+    sizeof(struct wine_managed_executor_layout), WINE_MANAGED_EXECUTOR_LAYOUT_ID,
+    WINE_MANAGED_HOST_START, WINE_MANAGED_HOST_END,
+    WINE_MANAGED_HOST_NTDLL_START, WINE_MANAGED_HOST_NTDLL_END,
+    WINE_MANAGED_KUSER_START, WINE_MANAGED_KUSER_END,
+    WINE_MANAGED_DISPATCH_START, WINE_MANAGED_DISPATCH_END
+};
 
 static struct wine_preload_info preload_info[] =
 {
@@ -407,6 +429,9 @@ SYSCALL_FUNC( wld_close, 3 /* SYS_close */ );
 
 void *wld_mmap( void *start, size_t len, int prot, int flags, int fd, off_t offset );
 SYSCALL_FUNC( wld_mmap, 9 /* SYS_mmap */ );
+
+int wld_munmap( void *start, size_t len );
+SYSCALL_FUNC( wld_munmap, 11 /* SYS_munmap */ );
 
 int wld_mprotect( const void *addr, size_t len, int prot );
 SYSCALL_FUNC( wld_mprotect, 10 /* SYS_mprotect */ );
@@ -760,6 +785,93 @@ static __attribute__((noreturn,format(printf,1,2))) void fatal_error(const char 
     wld_exit(1);
 }
 
+static unsigned long long parse_managed_hex( const char **str )
+{
+    unsigned long long value = 0;
+    const char *p = *str;
+    unsigned int digit, count = 0;
+
+    while (*p)
+    {
+        if (*p >= '0' && *p <= '9') digit = *p - '0';
+        else if (*p >= 'a' && *p <= 'f') digit = *p - 'a' + 10;
+        else if (*p >= 'A' && *p <= 'F') digit = *p - 'A' + 10;
+        else break;
+        if (++count > 16) fatal_error( "preloader: managed image range overflow\n" );
+        value = (value << 4) | digit;
+        p++;
+    }
+    if (!count) fatal_error( "preloader: malformed managed image range\n" );
+    *str = p;
+    return value;
+}
+
+/* The image reservation remains an allocation exclusion, not another mmap. */
+static void validate_managed_image_range( const char *str )
+{
+    unsigned long long start, end;
+
+    if (!str) return;
+    start = parse_managed_hex( &str );
+    if (!*str && !start) return;
+    if (*str++ != '-') fatal_error( "preloader: malformed managed image range\n" );
+    end = parse_managed_hex( &str );
+    if (*str) fatal_error( "preloader: malformed managed image range\n" );
+    if (!start && !end) return;
+    if (end <= start || (managed_role == WINE_MANAGED_LAYOUT_EXECUTOR ?
+        (start < WINE_MANAGED_HOST_ALLOC_START || end > WINE_MANAGED_HOST_END) :
+        (start < WINE_MANAGED_GUEST_START || end > WINE_MANAGED_GUEST_END)))
+        fatal_error( "preloader: image range outside managed guest range\n" );
+}
+
+#ifdef __x86_64__
+static void reserve_managed_range( void *start, size_t size, const char *name )
+{
+    void *ptr = wld_mmap( start, size, PROT_NONE,
+                         MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0 );
+
+    if (ptr != start)
+    {
+        /* Old kernels may ignore NOREPLACE and choose another address. */
+        if (ptr != (void *)-1) wld_munmap( ptr, size );
+        fatal_error( "preloader: managed %s reservation failed or collided\n", name );
+    }
+}
+#endif
+
+static void reserve_managed_layout( const char *setting, const char *reserve )
+{
+#if defined(__x86_64__)
+    if (!wld_strcmp( setting, WINE_MANAGED_LAYOUT_SETTING ))
+        managed_role = WINE_MANAGED_LAYOUT_TARGET;
+    else if (!wld_strcmp( setting, WINE_MANAGED_EXECUTOR_SETTING ))
+        managed_role = WINE_MANAGED_LAYOUT_EXECUTOR;
+    else fatal_error( "preloader: unsupported WINE_MANAGED_LAYOUT value\n" );
+    if (page_size != 4096) fatal_error( "preloader: unsupported managed page size\n" );
+    validate_managed_image_range( reserve );
+    reserve_managed_range( (void *)WINE_MANAGED_GUEST_START,
+                           WINE_MANAGED_GUEST_END - WINE_MANAGED_GUEST_START, "guest" );
+    preload_info[0].addr = (void *)WINE_MANAGED_GUEST_START;
+    preload_info[0].size = WINE_MANAGED_GUEST_END - WINE_MANAGED_GUEST_START;
+    if (managed_role == WINE_MANAGED_LAYOUT_EXECUTOR)
+    {
+        reserve_managed_range( (void *)WINE_MANAGED_HOST_START,
+                               WINE_MANAGED_HOST_END - WINE_MANAGED_HOST_START, "host" );
+        preload_info[1].addr = (void *)WINE_MANAGED_HOST_START;
+        preload_info[1].size = WINE_MANAGED_HOST_END - WINE_MANAGED_HOST_START;
+        preload_info[2].addr = NULL;
+        preload_info[2].size = 0;
+    }
+    else
+    {
+        preload_info[1].addr = NULL;
+        preload_info[1].size = 0;
+    }
+#else
+    fatal_error( "preloader: managed layout requires Linux AMD64\n" );
+#endif
+}
+
 /*
  * The __stack_chk_* symbols are only used when file is compiled with gcc flags
  * "-fstack-protector".  This function is normally provided by libc's startup
@@ -931,6 +1043,7 @@ static void map_so_lib( const char *name, struct wld_link_map *l)
         int prot;
       } loadcmds[16], *c;
     size_t nloadcmds = 0, maplength;
+    ElfW(Addr) managed_object_end = 0;
 
     fd = wld_open( name, O_RDONLY );
     if (fd == -1) fatal_error("%s: could not open\n", name );
@@ -963,7 +1076,13 @@ static void map_so_lib( const char *name, struct wld_link_map *l)
     if (header->e_phnum > sizeof(loadcmds)/sizeof(loadcmds[0]))
         fatal_error( "%s: oops... not enough space for load commands\n", name );
 
+    if (managed_role && header->e_type != ET_DYN)
+        fatal_error( "%s: managed startup requires a PIE ELF object\n", name );
+
     maplength = header->e_phnum * sizeof (ElfW(Phdr));
+    if (managed_role && (header->e_phoff > sizeof(buf) || maplength > sizeof(buf) - header->e_phoff ||
+                           header->e_phentsize != sizeof(ElfW(Phdr))))
+        fatal_error( "%s: invalid managed ELF program header table\n", name );
     if (header->e_phoff + maplength > sizeof(buf))
         fatal_error( "%s: oops... not enough space for ELF headers\n", name );
 
@@ -1005,6 +1124,13 @@ static void map_so_lib( const char *name, struct wld_link_map *l)
 
         case PT_LOAD:
           {
+            if (managed_role &&
+                (!ph->p_memsz || ph->p_filesz > ph->p_memsz || ph->p_align < page_size ||
+                 (ph->p_align & (ph->p_align - 1)) ||
+                 ph->p_memsz > (ElfW(Addr))-1 - ph->p_vaddr ||
+                 page_mask > (ElfW(Addr))-1 - ph->p_vaddr - ph->p_memsz ||
+                 ph->p_offset > (ElfW(Addr))-1 - ph->p_filesz))
+                fatal_error( "%s: invalid managed ELF load segment\n", name );
             if ((ph->p_align & page_mask) != 0)
               fatal_error( "%s: ELF load command alignment not page-aligned\n", name );
 
@@ -1017,6 +1143,14 @@ static void map_so_lib( const char *name, struct wld_link_map *l)
             c->dataend = ph->p_vaddr + ph->p_filesz;
             c->allocend = ph->p_vaddr + ph->p_memsz;
             c->mapoff = ph->p_offset & ~(ph->p_align - 1);
+
+            if (managed_role)
+            {
+                ElfW(Addr) end = (c->allocend + page_mask) & ~page_mask;
+                if (nloadcmds > 1 && c->mapstart < c[-1].mapstart)
+                    fatal_error( "%s: unordered managed ELF load segments\n", name );
+                if (end > managed_object_end) managed_object_end = end;
+            }
 
             c->prot = 0;
             if (ph->p_flags & PF_R)
@@ -1052,6 +1186,7 @@ static void map_so_lib( const char *name, struct wld_link_map *l)
 
     /* Length of the sections to be loaded.  */
     maplength = loadcmds[nloadcmds - 1].allocend - c->mapstart;
+    if (managed_role) maplength = managed_object_end - c->mapstart;
 
     if( header->e_type == ET_DYN )
     {
@@ -1063,15 +1198,21 @@ static void map_so_lib( const char *name, struct wld_link_map *l)
         l->l_map_start = (ElfW(Addr)) wld_mmap ((void *) mappref, maplength,
                                               c->prot, MAP_COPY | MAP_FILE,
                                               fd, c->mapoff);
+        if (managed_role &&
+            (l->l_map_start == (ElfW(Addr))-1 || l->l_map_start < (managed_role == WINE_MANAGED_LAYOUT_EXECUTOR ?
+                                  WINE_MANAGED_HOST_END : WINE_MANAGED_GUEST_END) ||
+             maplength > (ElfW(Addr))-1 - l->l_map_start))
+            fatal_error( "%s: managed ELF mapping failed or entered guest range\n", name );
         /* wld_printf("set  : offset = %x\n", c->mapoff); */
         /* wld_printf("l->l_map_start = %x\n", l->l_map_start); */
 
         l->l_map_end = l->l_map_start + maplength;
         l->l_addr = l->l_map_start - c->mapstart;
 
-        wld_mprotect ((caddr_t) (l->l_addr + c->mapend),
-                    loadcmds[nloadcmds - 1].allocend - c->mapend,
-                    PROT_NONE);
+        if (wld_mprotect ((caddr_t) (l->l_addr + c->mapend),
+                          (managed_role ? managed_object_end : loadcmds[nloadcmds - 1].allocend) - c->mapend,
+                          PROT_NONE) == -1 && managed_role)
+            fatal_error( "%s: managed ELF reservation protection failed\n", name );
         goto postmap;
     }
     else
@@ -1091,11 +1232,18 @@ static void map_so_lib( const char *name, struct wld_link_map *l)
 
     while (c < &loadcmds[nloadcmds])
       {
+        if (managed_role && (c->mapstart < loadcmds[0].mapstart ||
+                               c->allocend > managed_object_end || c->mapend > managed_object_end))
+            fatal_error( "%s: managed ELF segment outside reserved object span\n", name );
         if (c->mapend > c->mapstart)
+          {
+            void *addr = (void *)(l->l_addr + c->mapstart), *ret;
             /* Map the segment contents from the file.  */
-            wld_mmap ((void *) (l->l_addr + c->mapstart),
-                        c->mapend - c->mapstart, c->prot,
-                        MAP_FIXED | MAP_COPY | MAP_FILE, fd, c->mapoff);
+            ret = wld_mmap( addr, c->mapend - c->mapstart, c->prot,
+                            MAP_FIXED | MAP_COPY | MAP_FILE, fd, c->mapoff );
+            if (managed_role && ret != addr)
+                fatal_error( "%s: managed ELF segment mapping failed\n", name );
+          }
 
       postmap:
         if (l->l_phdr == 0
@@ -1134,19 +1282,23 @@ static void map_so_lib( const char *name, struct wld_link_map *l)
                 if ((c->prot & PROT_WRITE) == 0)
                   {
                     /* Dag nab it.  */
-                    wld_mprotect ((caddr_t) (zero & ~page_mask), page_size, c->prot|PROT_WRITE);
+                    if (wld_mprotect ((caddr_t) (zero & ~page_mask), page_size, c->prot|PROT_WRITE) == -1 &&
+                        managed_role)
+                        fatal_error( "%s: managed ELF zero-fill protection failed\n", name );
                   }
                 wld_memset ((void *) zero, '\0', zeropage - zero);
                 if ((c->prot & PROT_WRITE) == 0)
-                  wld_mprotect ((caddr_t) (zero & ~page_mask), page_size, c->prot);
+                  if (wld_mprotect ((caddr_t) (zero & ~page_mask), page_size, c->prot) == -1 && managed_role)
+                      fatal_error( "%s: managed ELF protection restore failed\n", name );
               }
 
             if (zeroend > zeropage)
               {
                 /* Map the remaining zero pages in from the zero fill FD.  */
-                wld_mmap ((caddr_t) zeropage, zeroend - zeropage,
-                                c->prot, MAP_ANON|MAP_PRIVATE|MAP_FIXED,
-                                -1, 0);
+                void *ret = wld_mmap ((caddr_t) zeropage, zeroend - zeropage,
+                                      c->prot, MAP_ANON|MAP_PRIVATE|MAP_FIXED, -1, 0);
+                if (managed_role && ret != (void *)zeropage)
+                    fatal_error( "%s: managed ELF zero-fill mapping failed\n", name );
               }
           }
 
@@ -1438,10 +1590,11 @@ void* wld_start( void **stack )
 {
     long i, *pargc;
     char **argv, **p;
-    char *interp, *reserve = NULL;
+    char *interp, *reserve = NULL, *managed = NULL;
     struct wld_auxv new_av[8], delete_av[3], *av;
     struct wld_link_map main_binary_map, ld_so_map;
     struct wine_preload_info **wine_main_preload_info;
+    const struct wine_managed_layout **wine_main_managed_layout;
     struct r_debug *ld_so_r_debug, **wine_r_debug;
 
     pargc = *stack;
@@ -1455,7 +1608,13 @@ void* wld_start( void **stack )
     while (*p)
     {
         static const char res[] = "WINEPRELOADRESERVE=";
+        static const char layout[] = "WINE_MANAGED_LAYOUT=";
         if (!wld_strncmp( *p, res, sizeof(res)-1 )) reserve = *p + sizeof(res) - 1;
+        if (!wld_strncmp( *p, layout, sizeof(layout)-1 ))
+        {
+            if (managed) fatal_error( "preloader: duplicate managed layout setting\n" );
+            managed = *p + sizeof(layout) - 1;
+        }
         p++;
     }
 
@@ -1475,8 +1634,9 @@ void* wld_start( void **stack )
     init_r_debug( av );
 
     /* reserve memory that Wine needs */
-    if (reserve) preload_reserve( reserve );
-    for (i = 0; preload_info[i].size; i++)
+    if (managed) reserve_managed_layout( managed, reserve );
+    else if (reserve) preload_reserve( reserve );
+    for (i = 0; !managed_role && preload_info[i].size; i++)
     {
         if ((char *)av >= (char *)preload_info[i].addr &&
             (char *)pargc <= (char *)preload_info[i].addr + preload_info[i].size)
@@ -1502,7 +1662,7 @@ void* wld_start( void **stack )
 
     /* add an executable page at the top of the address space to defeat
      * broken no-exec protections that play with the code selector limit */
-    if (is_addr_reserved( (char *)0x80000000 - page_size ))
+    if (!managed_role && is_addr_reserved( (char *)0x80000000 - page_size ))
         wld_mprotect( (char *)0x80000000 - page_size, page_size, PROT_EXEC | PROT_READ );
 
     /* load the main binary */
@@ -1527,6 +1687,15 @@ void* wld_start( void **stack )
     wine_main_preload_info = find_symbol( &main_binary_map, "wine_main_preload_info", STT_OBJECT );
     if (wine_main_preload_info) *wine_main_preload_info = preload_info;
     else wld_printf( "wine_main_preload_info not found\n" );
+
+    wine_main_managed_layout = find_symbol( &main_binary_map, "wine_main_managed_layout", STT_OBJECT );
+    if (managed_role)
+    {
+        if (!wine_main_preload_info || !wine_main_managed_layout)
+            fatal_error( "preloader: managed loader handoff symbols missing\n" );
+        *wine_main_managed_layout = managed_role == WINE_MANAGED_LAYOUT_EXECUTOR ?
+            &managed_executor_layout.common : &managed_target_layout;
+    }
 
 #define SET_NEW_AV(n,type,val) new_av[n].a_type = (type); new_av[n].a_un.a_val = (val);
     SET_NEW_AV( 0, AT_PHDR, (unsigned long)main_binary_map.l_phdr );

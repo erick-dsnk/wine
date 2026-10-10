@@ -39,6 +39,10 @@
 #endif
 
 #include "main.h"
+#include "wine/managed_layout.h"
+
+/* Set only by the real preloader, and copied once by ntdll at admission. */
+const __attribute__((visibility("default"))) struct wine_managed_layout *wine_main_managed_layout;
 
 #if defined(__APPLE__) && defined(__x86_64__) && !defined(HAVE_WINE_PRELOADER)
 

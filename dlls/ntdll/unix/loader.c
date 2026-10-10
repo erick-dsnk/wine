@@ -23,6 +23,7 @@
 #endif
 
 #include "config.h"
+#include "wine/managed_layout.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -548,6 +549,9 @@ char *get_alternate_wineloader( WORD machine )
 static void preloader_exec( char **argv, WORD machine )
 {
 #ifdef HAVE_WINE_PRELOADER
+    if (getenv( "WINE_MANAGED_LAYOUT" ))
+        asprintf( &argv[0], "%s-preloader", argv[1] );
+    else
 #if !defined(__arm__) && !defined(__aarch64__)
     if (machine == IMAGE_FILE_MACHINE_AMD64)
         asprintf( &argv[0], "%s64-preloader", argv[1] );
@@ -567,6 +571,8 @@ static void preloader_exec( char **argv, WORD machine )
     execv( argv[0], argv );
     free( argv[0] );
 #endif
+    if (getenv( "WINE_MANAGED_LAYOUT" ))
+        fatal_error( "managed layout requires a working Wine preloader\n" );
     execv( argv[1], argv + 1 );
 }
 
@@ -597,6 +603,19 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info 
     ULONGLONG res_end = pe_info->base + pe_info->map_size;
     const char *ld_preload = getenv( "LD_PRELOAD" );
     char preloader_reserve[64], socket_env[64];
+
+    /* Admission persists even if Windows code later edits its environment. */
+    if (virtual_is_managed_target() || virtual_is_managed_executor())
+    {
+        const char *setting = virtual_is_managed_executor() ?
+            WINE_MANAGED_EXECUTOR_SETTING : WINE_MANAGED_LAYOUT_SETTING;
+
+        if (machine != IMAGE_FILE_MACHINE_AMD64) return STATUS_NOT_SUPPORTED;
+        if (setenv( "WINE_MANAGED_LAYOUT", setting, 1 )) return STATUS_NO_MEMORY;
+        /* The child's ordinary PE image will relocate into its physical host
+         * domain; its original preferred guest base is not a startup slot. */
+        if (virtual_is_managed_executor()) res_start = res_end = 0;
+    }
 
     if (pe_info->wine_fakedll) res_start = res_end = 0;
     if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady) machine = native_machine;
@@ -1006,6 +1025,12 @@ static NTSTATUS dlopen_dll( const char *so_name, UNICODE_STRING *nt_name, void *
 {
     void *module, *handle;
     const IMAGE_NT_HEADERS *nt;
+
+    if (virtual_is_managed_target() || virtual_is_managed_executor())
+    {
+        WARN( "legacy .so builtin %s is unsupported in managed target layout\n", debugstr_a(so_name) );
+        return STATUS_NOT_SUPPORTED;
+    }
 
     handle = dlopen( so_name, RTLD_NOW );
     if (!handle)
@@ -2128,12 +2153,28 @@ static void load_ntdll(void)
     else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
 
     if (is_arm64ec()) machine = main_image_info.Machine;
-    status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0, machine, FALSE, 0 );
-    if (status == STATUS_DLL_NOT_FOUND)
+    if (virtual_is_managed_executor())
     {
-        free( name );
-        asprintf( &name, "%s/ntdll.dll%c.so", ntdll_dir, 0 );
-        status = open_builtin_so_file( name, &attr, &module, &info, machine, 0, FALSE );
+        HANDLE mapping;
+
+        status = open_dll_file( name, &attr, &mapping );
+        if (!status)
+        {
+            status = virtual_map_host_ntdll( mapping, &module, &size, &info );
+            NtClose( mapping );
+        }
+        if (NT_SUCCESS(status) && module != (void *)WINE_MANAGED_HOST_NTDLL_START)
+            fatal_error( "executor ntdll did not map at its canonical address\n" );
+    }
+    else
+    {
+        status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0, machine, FALSE, 0 );
+        if (status == STATUS_DLL_NOT_FOUND)
+        {
+            free( name );
+            asprintf( &name, "%s/ntdll.dll%c.so", ntdll_dir, 0 );
+            status = open_builtin_so_file( name, &attr, &module, &info, machine, 0, FALSE );
+        }
     }
     if (status == STATUS_IMAGE_NOT_AT_BASE) status = virtual_relocate_module( module );
     if (status) fatal_error( "failed to load %s error %x\n", name, status );
@@ -2438,6 +2479,7 @@ static void hacks_init(void)
 static void start_main_thread(void)
 {
     TEB *teb = virtual_alloc_first_teb();
+    NTSTATUS status;
 
     signal_init_threading();
     dbg_init();
@@ -2453,9 +2495,14 @@ static void start_main_thread(void)
 
     mallopt( M_PERTURB, 0xff );
     init_startup_info();
+    if ((virtual_is_managed_target() || virtual_is_managed_executor()) &&
+        main_image_info.Machine != IMAGE_FILE_MACHINE_AMD64)
+        fatal_error( "managed layout supports only AMD64 images\n" );
     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
     set_load_order_app_name( main_wargv[0] );
-    init_thread_stack( teb, 0, 0, 0 );
+    status = init_thread_stack( teb, 0, 0, 0 );
+    if (virtual_is_managed_executor() && status)
+        fatal_error( "failed to initialize executor thread stacks: %x\n", status );
     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
     load_ntdll();
     load_wow64_ntdll( main_image_info.Machine );
@@ -2744,7 +2791,8 @@ static void reexec_loader( int argc, char *argv[], char *extra_arg )
     }
 
     /* default to 32-bit loader to support 32-bit prefixes */
-    if (machine == IMAGE_FILE_MACHINE_AMD64) machine = IMAGE_FILE_MACHINE_I386;
+    if (machine == IMAGE_FILE_MACHINE_AMD64 && !getenv( "WINE_MANAGED_LAYOUT" ))
+        machine = IMAGE_FILE_MACHINE_I386;
 
     loader_exec( new_argv, machine );
     fatal_error( "could not exec the wine loader\n" );

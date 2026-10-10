@@ -256,6 +256,7 @@ extern void process_exit_wrapper( int status ) DECLSPEC_NORETURN;
 extern size_t server_init_process(void);
 extern void server_init_process_done(void);
 extern void server_init_thread( void *entry_point, BOOL *suspend );
+extern BOOL server_thread_is_initialized(void);
 extern int server_pipe( int fd[2] );
 
 extern void fpux_to_fpu( I386_FLOATING_SAVE_AREA *fpu, const XSAVE_FORMAT *fpux );
@@ -295,11 +296,16 @@ extern void *steamclient_handle_fault( LPCVOID addr, DWORD err );
 extern void *anon_mmap_fixed( void *start, size_t size, int prot, int flags );
 extern void *anon_mmap_alloc( size_t size, int prot );
 extern void virtual_init(void);
+extern BOOL virtual_is_managed_target(void);
+extern BOOL virtual_is_managed_executor(void);
+extern NTSTATUS virtual_map_syscall_dispatcher( void *dispatcher );
 extern ULONG_PTR get_system_affinity_mask(void);
 extern void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 );
 extern NTSTATUS virtual_map_builtin_module( HANDLE mapping, void **module, SIZE_T *size,
                                             SECTION_IMAGE_INFORMATION *info, ULONG_PTR limit_low,
                                             ULONG_PTR limit_high, WORD machine, BOOL prefer_native, off_t offset );
+extern NTSTATUS virtual_map_host_ntdll( HANDLE mapping, void **module, SIZE_T *size,
+                                        SECTION_IMAGE_INFORMATION *info );
 extern NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size,
                                     SECTION_IMAGE_INFORMATION *info, ULONG_PTR limit_low,
                                     ULONG_PTR limit_high, USHORT machine );

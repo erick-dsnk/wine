@@ -38,6 +38,8 @@
 #define IOCTL_WINETEST_COMPLETION               CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80c, METHOD_NEITHER, FILE_ANY_ACCESS)
 #define IOCTL_WINETEST_QUEUE_ASYNC              CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80d, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_WINETEST_COMPLETE_ASYNC           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80e, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINETEST_PROCESS_ATTACHMENT       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80f, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINETEST_SHARED_KERNEL_MEMORY     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define IOCTL_WINETEST_BUS_MAIN             CTL_CODE(FILE_DEVICE_BUS_EXTENDER, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_WINETEST_BUS_REGISTER_IFACE   CTL_CODE(FILE_DEVICE_BUS_EXTENDER, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -77,6 +79,32 @@ struct return_status_params
     NTSTATUS ret_status;
     NTSTATUS iosb_status;
     BOOL pending;
+};
+
+/* Five observations: caller, A, nested B, restored A, restored caller. */
+#define ATTACHMENT_OBSERVATIONS 5
+struct attachment_input
+{
+    DWORD process_id[2];
+    ULONG_PTR common_address;
+    ULONG_PTR target_address;
+};
+
+struct attachment_observation
+{
+    NTSTATUS common_status;
+    NTSTATUS target_status;
+    BYTE common_value;
+    BYTE target_value;
+};
+
+struct attachment_output
+{
+    NTSTATUS lookup_status[2];
+    NTSTATUS fault_status;
+    NTSTATUS valid_status;
+    BYTE valid_value;
+    struct attachment_observation observations[ATTACHMENT_OBSERVATIONS];
 };
 
 static const GUID control_class = {0xdeadbeef, 0x29ef, 0x4538, {0xa5, 0xfd, 0xb6, 0x95, 0x73, 0xa3, 0x62, 0xc0}};
