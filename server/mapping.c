@@ -257,6 +257,32 @@ struct private_mapping_lease
     int pidfd;
 };
 
+static unsigned __int64 private_lease_trace_sequence;
+static int private_lease_trace_enabled = -1;
+
+static void trace_private_lease( struct private_mapping_lease *lease, const char *event,
+                                 const char *detail )
+{
+    struct private_mapping_lease *other;
+    unsigned int leases = 0;
+
+    if (private_lease_trace_enabled == -1)
+    {
+        const char *value = getenv( "WINE_PRIVATE_MAPPING_TRACE" );
+        private_lease_trace_enabled = value && !strcmp( value, "1" );
+    }
+    if (!debug_level && !private_lease_trace_enabled) return;
+    LIST_FOR_EACH_ENTRY( other, &lease->mapping->leases, struct private_mapping_lease, entry ) ++leases;
+    fprintf( stderr, "private-lease event=%s mapping_id=%llu lease=%llu generation=%llu "
+             "owner_pid=%04x consumer_pid=%04x handle=%04x state=%u status=%08x apc_count=%u "
+             "mapping_leases=%u detail=%s seq=%llu time=%llu\n",
+             event, (unsigned long long)lease->mapping->id, (unsigned long long)lease->token,
+             (unsigned long long)lease->generation, lease->mapping->owner->id,
+             lease->consumer->id, lease->handle, lease->state, lease->status, lease->apc_count,
+             leases, detail, (unsigned long long)++private_lease_trace_sequence,
+             (unsigned long long)monotonic_time );
+}
+
 static void private_mapping_dump( struct object *obj, int verbose );
 static struct fd *private_mapping_get_fd( struct object *obj );
 static void private_mapping_destroy( struct object *obj );
@@ -1476,15 +1502,22 @@ static void private_lease_revoked( struct private_mapping_lease *lease )
 {
     struct private_mapping *mapping = lease->mapping;
     if (lease->state == PRIVATE_MAPPING_LEASE_REVOKED) return;
+    trace_private_lease( lease, "revoking_complete", "before_state_change" );
     lease->state = PRIVATE_MAPPING_LEASE_REVOKED;
     if (lease->status == STATUS_PENDING) lease->status = STATUS_CANCELLED;
     if (lease->death_timer) remove_timeout_user( lease->death_timer );
     lease->death_timer = NULL;
     list_remove( &lease->entry );
-    if (!lease->apc_count) set_event( lease->ready );
+    trace_private_lease( lease, "revoked", "after_list_remove" );
+    if (!lease->apc_count)
+    {
+        set_event( lease->ready );
+        trace_private_lease( lease, "ready", "lease_revoked" );
+    }
     if (list_empty( &mapping->leases ))
     {
         set_event( mapping->ready );
+        trace_private_lease( lease, "ready", "mapping_no_leases" );
         if (mapping->exit_waiting)
         {
             mapping->exit_waiting = 0;
@@ -1499,13 +1532,19 @@ void private_mapping_apc_finished( struct object *obj, int cancelled )
 {
     struct private_mapping_lease *lease = (struct private_mapping_lease *)obj;
     assert( lease->apc_count );
+    trace_private_lease( lease, "apc_finished", cancelled ? "cancelled_before_count_drop" : "completed_before_count_drop" );
     --lease->apc_count;
+    trace_private_lease( lease, "apc_count", "after_count_drop" );
     if (cancelled && lease->state == PRIVATE_MAPPING_LEASE_PENDING)
     {
         lease->status = STATUS_CANCELLED;
         private_lease_revoked( lease );
     }
-    else if (!lease->apc_count && lease->state == PRIVATE_MAPPING_LEASE_REVOKED) set_event( lease->ready );
+    else if (!lease->apc_count && lease->state == PRIVATE_MAPPING_LEASE_REVOKED)
+    {
+        set_event( lease->ready );
+        trace_private_lease( lease, "ready", "apcs_drained" );
+    }
 }
 
 static int queue_private_lease_apc( struct private_mapping_lease *lease, int revoke )
@@ -1519,8 +1558,10 @@ static int queue_private_lease_apc( struct private_mapping_lease *lease, int rev
     call.private_mapping.generation = lease->generation;
     call.private_mapping.revoke = revoke;
     ++lease->apc_count;
+    trace_private_lease( lease, "queue", revoke ? "REVOKE" : "MAP" );
     if (thread_queue_apc( lease->consumer, NULL, &lease->obj, &call )) return 1;
     if (lease->apc_count > previous) --lease->apc_count;
+    trace_private_lease( lease, "queue_failed", revoke ? "REVOKE" : "MAP" );
     return 0;
 }
 
@@ -1529,10 +1570,18 @@ static void private_lease_check_death( void *private )
     struct private_mapping_lease *lease = private;
     struct pollfd fd = { lease->pidfd, POLLIN, 0 };
     lease->death_timer = NULL;
-    if (poll( &fd, 1, 0 ) == 1 && (fd.revents & POLLIN)) private_lease_revoked( lease );
+    if (poll( &fd, 1, 0 ) == 1 && (fd.revents & POLLIN))
+    {
+        trace_private_lease( lease, "death", "pidfd_readable" );
+        private_lease_revoked( lease );
+    }
     else
     {
-        if (!lease->apc_count) queue_private_lease_apc( lease, 1 );
+        if (!lease->apc_count)
+        {
+            trace_private_lease( lease, "retry", "no_apc_pidfd_not_readable" );
+            queue_private_lease_apc( lease, 1 );
+        }
         lease->death_timer = add_timeout_user( -TICKS_PER_SEC / 10, private_lease_check_death, lease );
     }
 }
@@ -1542,6 +1591,7 @@ static void revoke_private_lease( struct private_mapping_lease *lease )
     if (lease->state >= PRIVATE_MAPPING_LEASE_REVOKING) return;
     reset_event( lease->ready );
     lease->state = PRIVATE_MAPPING_LEASE_REVOKING;
+    trace_private_lease( lease, "revoking", "ready_reset" );
     /* Queue failure is not successful revocation. Keep the lease fenced until
      * a genuine acknowledgement or observed OS process death. */
     queue_private_lease_apc( lease, 1 );
@@ -1843,11 +1893,13 @@ DECL_HANDLER(confirm_private_mapping_lease)
     else
     {
         lease->status = req->status;
+        trace_private_lease( lease, "confirm", "client_status" );
         if (req->status) private_lease_revoked( lease );
         else
         {
             lease->state = PRIVATE_MAPPING_LEASE_LIVE;
             set_event( lease->ready );
+            trace_private_lease( lease, "ready", "map_live" );
         }
     }
     release_object( lease );
@@ -1868,7 +1920,11 @@ DECL_HANDLER(ack_private_mapping_revoke)
     if (!(lease = get_private_lease( req->handle, req->token, req->generation ))) return;
     if (lease->state != PRIVATE_MAPPING_LEASE_REVOKING && lease->state != PRIVATE_MAPPING_LEASE_REVOKED)
         set_error( STATUS_INVALID_PARAMETER );
-    else private_lease_revoked( lease );
+    else
+    {
+        trace_private_lease( lease, "ack", "revoke_client" );
+        private_lease_revoked( lease );
+    }
     release_object( lease );
 }
 

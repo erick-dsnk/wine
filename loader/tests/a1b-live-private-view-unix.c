@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <poll.h>
 #include <sys/syscall.h>
+#include <signal.h>
+#include <time.h>
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
@@ -32,6 +34,49 @@ static size_t collision_size;
 static int reservation_fd = -1;
 static off_t reservation_offset;
 static int watched_pidfd = -1;
+/* Test-only recipient control: no runtime scheduler hooks or fabricated ACK.
+ * Mask only the main's Wine system-APC notification signal. SIGQUIT stays live
+ * so TerminateThread performs the real server queue cancellation. */
+static NTSTATUS cancellation_barrier( unsigned int action, UINT64 phase )
+{
+    const char *directory = getenv( "A1B_VIEW_GATE_DIR" );
+    char path[1024];
+    struct timespec start, now, delay = { 0, 1000000 };
+    sigset_t mask;
+    int fd;
+    if (!directory || phase > 1) return STATUS_INVALID_PARAMETER;
+    if (action == 5)
+    {
+        sigemptyset( &mask ); sigaddset( &mask, SIGUSR1 );
+        if (sigprocmask( SIG_BLOCK, &mask, NULL )) return STATUS_UNSUCCESSFUL;
+        sigemptyset( &mask ); sigaddset( &mask, SIGQUIT );
+        if (sigprocmask( SIG_UNBLOCK, &mask, NULL )) return STATUS_UNSUCCESSFUL;
+        snprintf( path, sizeof(path), "%s/parked-%s", directory, phase ? "revoke" : "map" );
+        if ((fd = open( path, O_WRONLY | O_CREAT | O_TRUNC, 0600 )) == -1) return STATUS_UNSUCCESSFUL;
+        close( fd );
+        sigprocmask( SIG_BLOCK, NULL, &mask );
+        fprintf( stderr, "a1b-cancellation: native-main SIGUSR1_blocked=%d SIGQUIT_blocked=%d\n",
+                 sigismember( &mask, SIGUSR1 ), sigismember( &mask, SIGQUIT ) );
+    }
+    else
+    {
+        sigprocmask( SIG_BLOCK, NULL, &mask );
+        fprintf( stderr, "a1b-cancellation: native-survivor action=%u SIGUSR1_blocked=%d SIGQUIT_blocked=%d\n",
+                 action, sigismember( &mask, SIGUSR1 ), sigismember( &mask, SIGQUIT ) );
+        snprintf( path, sizeof(path), "%s/%s-%s", directory,
+                  action == 6 ? "parked" : "kill", phase ? "revoke" : "map" );
+    }
+    clock_gettime( CLOCK_MONOTONIC, &start );
+    do
+    {
+        if (action != 5 && !access( path, F_OK )) return STATUS_SUCCESS;
+        nanosleep( &delay, NULL );
+        clock_gettime( CLOCK_MONOTONIC, &now );
+    } while (now.tv_sec - start.tv_sec < 10);
+    fprintf( stderr, "a1b-cancellation: native barrier timed out action=%u phase=%s\n",
+             action, phase ? "revoke" : "map" );
+    return STATUS_TIMEOUT;
+}
 static NTSTATUS collision_call( void *arguments )
 {
     struct collision_args *args = arguments;
@@ -42,6 +87,27 @@ static NTSTATUS collision_call( void *arguments )
     unsigned long start, end, offset, inode;
     unsigned int device_major, device_minor;
     BOOL reserved = FALSE;
+    if (args->action == 8)
+    {
+        static const char *paths[] = { "/proc/self/maps", "/proc/thread-self/maps" };
+        unsigned int index, count;
+        for (index = 0; index < sizeof(paths) / sizeof(paths[0]); ++index)
+        {
+            count = 0;
+            if (!(maps = fopen( paths[index], "r" ))) return STATUS_UNSUCCESSFUL;
+            while (fgets( line, sizeof(line), maps ))
+            {
+                ++count;
+                if (sscanf( line, "%lx-%lx", &start, &end ) == 2 && start <= 0x23010000 && end > 0x23000000)
+                    fprintf( stderr, "a1b-cancellation: native-survivor %s PROBE mapping %s", paths[index], line );
+            }
+            fclose( maps );
+            fprintf( stderr, "a1b-cancellation: native-survivor %s mapping_count=%u\n", paths[index], count );
+        }
+        return STATUS_SUCCESS;
+    }
+    if (args->action >= 5 && args->action <= 7)
+        return cancellation_barrier( args->action, args->address );
     if (args->action == 2)
     {
         args->address = getpid();

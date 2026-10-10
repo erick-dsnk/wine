@@ -34,7 +34,7 @@
 
 enum command { CMD_ALLOC, CMD_READ, CMD_WRITE, CMD_PROTECT, CMD_DECOMMIT,
                CMD_COMMIT, CMD_FREE, CMD_ACQUIRE, CMD_DROP, CMD_LOOP,
-               CMD_LOOP_RESULT, CMD_EXIT, CMD_BEGIN_ACQUIRE, CMD_END_ACQUIRE, CMD_QUERY, CMD_COLLISION_INSTALL, CMD_COLLISION_REMOVE, CMD_MUTATION_BEGIN, CMD_MUTATION_POLL, CMD_MUTATION_WAIT, CMD_OWNER_STATE, CMD_WATCH_NATIVE_PID, CMD_SUSPENDED_CREATE, CMD_SUSPENDED_KILL, CMD_CPU_BARRIER, CMD_NEGATIVE_VM };
+               CMD_LOOP_RESULT, CMD_EXIT, CMD_BEGIN_ACQUIRE, CMD_END_ACQUIRE, CMD_QUERY, CMD_COLLISION_INSTALL, CMD_COLLISION_REMOVE, CMD_MUTATION_BEGIN, CMD_MUTATION_POLL, CMD_MUTATION_WAIT, CMD_OWNER_STATE, CMD_WATCH_NATIVE_PID, CMD_SUSPENDED_CREATE, CMD_SUSPENDED_KILL, CMD_CPU_BARRIER, CMD_NEGATIVE_VM, CMD_DENIED_ACQUIRE, CMD_STALE_QUERY, CMD_CANCEL_BEGIN, CMD_CANCEL_END };
 struct packet
 {
     unsigned int command, value, target_pid, status;
@@ -46,16 +46,22 @@ struct lease { HANDLE handle, ready; unsigned __int64 token, generation, mapping
 static struct lease lease;
 static LONG checks, failures;
 static volatile LONG loop_stop, loop_reads, loop_faults;
-static HANDLE loop_thread, mutation_thread, suspended_thread;
+static HANDLE loop_thread, mutation_thread, mutation_observer, acquire_thread, suspended_thread;
 static unsigned int mutation_protection;
-static NTSTATUS mutation_status;
+static NTSTATUS mutation_status, acquire_status;
+static struct packet acquire_packet;
 static BOOL watch_native_death;
-struct loop_observation { volatile LONG completed, successful_after_completion, reads, faults, cpu_active, release_cpu; };
+static HANDLE cancelled_main, cancel_pipe;
+static DWORD cancelled_main_tid;
+static struct packet cancel_packet;
+static int child_loop( HANDLE pipe );
+struct loop_observation { volatile LONG completed, successful_after_completion, reads, faults, cpu_active, release_cpu, mutation_go, mutation_done, owner_updating, observer_ready, acquire_go; };
 static struct loop_observation *loop_observation;
 
 static void check( int ok, const char *description )
 {
     ++checks;
+    if (ok && getenv( "A1B_VERBOSE_CHECKS" )) printf( "a1b-live-private-view: PASS: %s\n", description );
     if (!ok)
     {
         ++failures;
@@ -124,12 +130,34 @@ static DWORD WINAPI suspended_worker( void *unused )
     (void)unused;
     return 0x5a;
 }
+static NTSTATUS owner_state( struct packet *packet );
+static DWORD WINAPI observe_mutation( void *unused )
+{
+    struct packet packet;
+    DWORD start = GetTickCount();
+    (void)unused;
+    InterlockedExchange( &loop_observation->observer_ready, 1 );
+    while (!InterlockedCompareExchange( &loop_observation->mutation_done, 0, 0 ) &&
+           GetTickCount() - start < TIMEOUT)
+    {
+        memset( &packet, 0, sizeof(packet) );
+        if (owner_state( &packet )) fatal( "observe authoritative owner fence" );
+        if (packet.state) InterlockedExchange( &loop_observation->owner_updating, 1 );
+        Sleep( 0 );
+    }
+    return 0;
+}
 static DWORD WINAPI mutation_worker( void *unused )
 {
-    DWORD old;
+    DWORD old, start = GetTickCount();
     (void)unused;
+    while ((!loop_observation->mutation_go || !loop_observation->observer_ready) &&
+           GetTickCount() - start < TIMEOUT) YieldProcessor();
+    if (!loop_observation->mutation_go || !loop_observation->observer_ready)
+        fatal( "parent did not start asynchronous mutation" );
     mutation_status = VirtualProtect( PROBE_ADDRESS, PROBE_SIZE, mutation_protection, &old ) ?
                       STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    InterlockedExchange( &loop_observation->mutation_done, 1 );
     return 0;
 }
 static NTSTATUS query_lease( struct packet *packet )
@@ -186,6 +214,45 @@ static NTSTATUS acquire_lease( struct packet *packet, BOOL wait )
     SERVER_END_REQ;
     CloseHandle( target );
     if (!status && wait) status = wait_lease( packet );
+    return status;
+}
+static DWORD WINAPI acquire_worker( void *unused )
+{
+    DWORD start = GetTickCount();
+    (void)unused;
+    while (!loop_observation->acquire_go && GetTickCount() - start < TIMEOUT) YieldProcessor();
+    if (!loop_observation->acquire_go) fatal( "parent did not start asynchronous acquisition" );
+    acquire_status = acquire_lease( &acquire_packet, FALSE );
+    return 0;
+}
+static NTSTATUS denied_acquire( struct packet *packet )
+{
+    HANDLE target = OpenProcess( PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, packet->target_pid );
+    NTSTATUS status;
+    if (!target) return STATUS_INVALID_CID;
+    SERVER_START_REQ( acquire_private_mapping )
+    {
+        req->process = wine_server_obj_handle( target );
+        req->address = (ULONG_PTR)PROBE_ADDRESS;
+        req->size = PROBE_SIZE;
+        req->access = FILE_READ_DATA | FILE_WRITE_DATA;
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    CloseHandle( target );
+    return status;
+}
+static NTSTATUS stale_query( unsigned int field )
+{
+    NTSTATUS status;
+    SERVER_START_REQ( query_private_mapping_lease )
+    {
+        req->handle = wine_server_obj_handle( lease.handle );
+        req->token = lease.token + !field;
+        req->generation = lease.generation + !!field;
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
     return status;
 }
 static NTSTATUS drop_lease( struct packet *packet )
@@ -254,6 +321,28 @@ static NTSTATUS native_helper( unsigned int action, ULONG_PTR value, unsigned in
     if (!status && output) *output = args.address;
     return status;
 }
+/* Fixture-only queue-before-dequeue control. The oldest main thread is parked
+ * in a native helper with SIGUSR1 blocked. This earlier-created survivor keeps
+ * its original signal mask and makes no Wine SELECT wait before cancellation.
+ * The external runner authorizes termination only after a queued trace names
+ * that exact main TID; neither thread assumes CREATE_SUSPENDED inhibits APCs. */
+static DWORD WINAPI cancel_survivor( void *unused )
+{
+    unsigned int phase = cancel_packet.offset;
+    (void)unused;
+    if (native_helper( 6, phase, NULL )) fatal( "recipient never entered native signal barrier" );
+    if (!phase) acquire_status = acquire_lease( &cancel_packet, FALSE );
+    if (native_helper( 7, phase, NULL )) fatal( "authoritative queued recipient kill was never authorized" );
+    if (!TerminateThread( cancelled_main, 0x51 )) fatal( "terminate authoritative queued APC recipient" );
+    if (WaitForSingleObject( cancelled_main, TIMEOUT ) != WAIT_OBJECT_0)
+        fatal( "authoritative recipient termination did not finish" );
+    printf( "a1b-live-private-view: cancelled-recipient phase=%s main_tid=%04lx survivor_tid=%04lx\n",
+            phase ? "revoke" : "map", cancelled_main_tid, GetCurrentThreadId() );
+    CloseHandle( cancelled_main ); cancelled_main = NULL;
+    if (native_helper( 8, 0, NULL )) fatal( "dump survivor native probe reservation" );
+    ExitProcess( child_loop( cancel_pipe ) );
+    return 0;
+}
 static NTSTATUS negative_alias_vm( unsigned int operation )
 {
     void *base = PROBE_ADDRESS;
@@ -296,16 +385,14 @@ static int child_main( const char *role, const char *pipe_name, const char *obse
 {
     struct packet packet;
     HANDLE pipe;
-    DWORD old;
-    void *pointer;
-    if (!strcmp( role, "executor" ))
     {
         HANDLE observation = OpenFileMappingA( FILE_MAP_ALL_ACCESS, FALSE, observation_name );
         if (!observation || !(loop_observation = MapViewOfFile( observation, FILE_MAP_ALL_ACCESS, 0, 0, 0 )))
             fatal( "map shared completion observation" );
         CloseHandle( observation );
-        if ((ULONG_PTR)loop_observation < WINE_MANAGED_HOST_ALLOC_START ||
-            (ULONG_PTR)loop_observation >= WINE_MANAGED_HOST_END)
+        if (!strcmp( role, "executor" ) &&
+            ((ULONG_PTR)loop_observation < WINE_MANAGED_HOST_ALLOC_START ||
+             (ULONG_PTR)loop_observation >= WINE_MANAGED_HOST_END))
             fatal( "executor observation escaped host domain" );
     }
     if (!AddVectoredExceptionHandler( 1, fault_handler )) fatal( "install actual exception observer" );
@@ -320,6 +407,13 @@ static int child_main( const char *role, const char *pipe_name, const char *obse
                     (ULONG_PTR)GetModuleHandleA( "ntdll.dll" ) != WINE_MANAGED_HOST_NTDLL_START ?
                     STATUS_INVALID_ADDRESS : STATUS_SUCCESS;
     pipe_transfer( pipe, &packet, TRUE );
+    return child_loop( pipe );
+}
+static int child_loop( HANDLE pipe )
+{
+    struct packet packet;
+    DWORD old;
+    void *pointer;
     for (;;)
     {
         pipe_transfer( pipe, &packet, FALSE );
@@ -362,14 +456,49 @@ static int child_main( const char *role, const char *pipe_name, const char *obse
             if (!VirtualFree( PROBE_ADDRESS, 0, MEM_RELEASE )) packet.status = STATUS_UNSUCCESSFUL;
             break;
         case CMD_ACQUIRE: packet.status = acquire_lease( &packet, TRUE ); break;
-        case CMD_BEGIN_ACQUIRE: packet.status = acquire_lease( &packet, FALSE ); break;
-        case CMD_END_ACQUIRE: packet.status = wait_lease( &packet ); break;
+        case CMD_BEGIN_ACQUIRE:
+            if (acquire_thread || lease.handle) { packet.status = STATUS_INVALID_HANDLE; break; }
+            acquire_packet = packet; acquire_status = STATUS_PENDING;
+            InterlockedExchange( &loop_observation->acquire_go, 0 );
+            acquire_thread = CreateThread( NULL, 0, acquire_worker, NULL, 0, NULL );
+            if (!acquire_thread) packet.status = STATUS_UNSUCCESSFUL;
+            break;
+        case CMD_END_ACQUIRE:
+            if (!acquire_thread) { packet.status = STATUS_INVALID_HANDLE; break; }
+            if (WaitForSingleObject( acquire_thread, TIMEOUT ) != WAIT_OBJECT_0)
+                fatal( "async acquisition did not finish" );
+            CloseHandle( acquire_thread ); acquire_thread = NULL;
+            packet.status = acquire_status ? acquire_status : wait_lease( &packet );
+            break;
         case CMD_DROP: packet.status = drop_lease( &packet ); break;
         case CMD_QUERY: packet.status = query_lease( &packet ); break;
         case CMD_OWNER_STATE: packet.status = owner_state( &packet ); break;
         case CMD_COLLISION_INSTALL: packet.status = native_helper( 0, (ULONG_PTR)PROBE_ADDRESS, NULL ); break;
         case CMD_COLLISION_REMOVE: packet.status = native_helper( 1, (ULONG_PTR)PROBE_ADDRESS, NULL ); break;
+        case CMD_DENIED_ACQUIRE: packet.status = denied_acquire( &packet ); break;
+        case CMD_STALE_QUERY: packet.status = stale_query( packet.value ); break;
         case CMD_NEGATIVE_VM: packet.status = negative_alias_vm( packet.value ); break;
+        case CMD_CANCEL_BEGIN:
+            if (cancelled_main || packet.offset > 1) { packet.status = STATUS_INVALID_PARAMETER; break; }
+            if (!DuplicateHandle( GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                                  &cancelled_main, 0, FALSE, DUPLICATE_SAME_ACCESS ))
+                fatal( "duplicate native-barrier recipient handle" );
+            cancelled_main_tid = GetCurrentThreadId(); cancel_pipe = pipe; cancel_packet = packet;
+            packet.count = cancelled_main_tid;
+            {
+                HANDLE survivor = CreateThread( NULL, 0, cancel_survivor, NULL, 0, NULL );
+                if (!survivor) fatal( "create independent cancellation survivor" );
+                CloseHandle( survivor );
+            }
+            pipe_transfer( pipe, &packet, TRUE );
+            if (native_helper( 5, packet.offset, NULL )) fatal( "native recipient barrier failed" );
+            fatal( "native recipient barrier returned without termination" );
+            break;
+        case CMD_CANCEL_END:
+            packet.count = cancelled_main_tid;
+            packet.status = cancel_packet.offset ? STATUS_SUCCESS :
+                            (acquire_status ? acquire_status : wait_lease( &packet ));
+            break;
         case CMD_SUSPENDED_CREATE:
             if (suspended_thread) { packet.status = STATUS_INVALID_HANDLE; break; }
             suspended_thread = CreateThread( NULL, 0, suspended_worker, NULL, CREATE_SUSPENDED, NULL );
@@ -396,6 +525,10 @@ static int child_main( const char *role, const char *pipe_name, const char *obse
         case CMD_MUTATION_BEGIN:
             if (mutation_thread) { packet.status = STATUS_INVALID_HANDLE; break; }
             mutation_protection = packet.value; mutation_status = STATUS_PENDING;
+            loop_observation->mutation_go = loop_observation->mutation_done = 0;
+            loop_observation->owner_updating = loop_observation->observer_ready = 0;
+            mutation_observer = CreateThread( NULL, 0, observe_mutation, NULL, 0, NULL );
+            if (!mutation_observer) fatal( "create owner fence observer" );
             mutation_thread = CreateThread( NULL, 0, mutation_worker, NULL, 0, NULL );
             if (!mutation_thread) packet.status = STATUS_UNSUCCESSFUL;
             break;
@@ -409,6 +542,9 @@ static int child_main( const char *role, const char *pipe_name, const char *obse
             if (WaitForSingleObject( mutation_thread, TIMEOUT ) != WAIT_OBJECT_0)
                 fatal( "async target mutation did not finish" );
             packet.status = mutation_status;
+            if (WaitForSingleObject( mutation_observer, TIMEOUT ) != WAIT_OBJECT_0)
+                fatal( "owner fence observer did not finish" );
+            CloseHandle( mutation_observer ); mutation_observer = NULL;
             CloseHandle( mutation_thread ); mutation_thread = NULL;
             break;
         case CMD_LOOP:
@@ -455,22 +591,38 @@ static struct child spawn_child( const char *role, unsigned int index )
     PROCESS_INFORMATION info;
     char exe[MAX_PATH], pipe_name[128], observation_name[128], command_line[2 * MAX_PATH + 512];
     DWORD length;
+    const char *setting, *backing = getenv( "A1B_DISABLE_BACKING" ) ? NULL : "1";
+    NTSTATUS (WINAPI *set_unix_env)( const char *, const char * );
     memset( &child, 0, sizeof(child) );
     memset( &startup, 0, sizeof(startup) ); startup.cb = sizeof(startup);
     length = GetModuleFileNameA( NULL, exe, sizeof(exe) );
     if (!length || length >= sizeof(exe)) fatal( "obtain complete executable path" );
+    if (!strcmp( role, "executor" ))
+    {
+        char *name = strrchr( exe, '\\' );
+        if (!name || strlen(exe) + strlen("executor\\") >= sizeof(exe))
+            fatal( "executor host-image path unavailable" );
+        memmove( name + 1 + strlen("executor\\"), name + 1, strlen(name + 1) + 1 );
+        memcpy( name + 1, "executor\\", strlen("executor\\") );
+    }
     sprintf( observation_name, "a1b-live-view-observation-%lu", GetCurrentProcessId() );
     sprintf( pipe_name, "\\\\.\\pipe\\a1b-live-view-%lu-%u", GetCurrentProcessId(), index );
     child.pipe = CreateNamedPipeA( pipe_name, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_WAIT,
                                   1, 4096, 4096, TIMEOUT, NULL );
     if (child.pipe == INVALID_HANDLE_VALUE) fatal( "create parent pipe" );
     sprintf( command_line, "\"%s\" %s \"%s\" \"%s\"", exe, role, pipe_name, observation_name );
-    SetEnvironmentVariableA( "WINE_MANAGED_LAYOUT", !strcmp( role, "executor" ) ?
-                             WINE_MANAGED_EXECUTOR_SETTING : WINE_MANAGED_LAYOUT_SETTING );
-    SetEnvironmentVariableA( "WINE_SHARED_PRIVATE_BACKING", "1" );
+    setting = !strcmp( role, "executor" ) ? WINE_MANAGED_EXECUTOR_SETTING : WINE_MANAGED_LAYOUT_SETTING;
+    set_unix_env = (void *)GetProcAddress( GetModuleHandleA( "ntdll.dll" ), "__wine_set_unix_env" );
+    if (!set_unix_env || set_unix_env( "WINE_MANAGED_LAYOUT", setting ) ||
+        set_unix_env( "WINE_SHARED_PRIVATE_BACKING", backing ) ||
+        !SetEnvironmentVariableA( "WINE_MANAGED_LAYOUT", setting ) ||
+        !SetEnvironmentVariableA( "WINE_SHARED_PRIVATE_BACKING", backing ))
+        fatal( "set actual preloader and Wine backing environments" );
     if (!CreateProcessA( NULL, command_line, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &info ))
         fatal( "start preloader-managed child" );
-    SetEnvironmentVariableA( "WINE_MANAGED_LAYOUT", NULL );
+    if (set_unix_env( "WINE_MANAGED_LAYOUT", NULL ) ||
+        !SetEnvironmentVariableA( "WINE_MANAGED_LAYOUT", NULL ))
+        fatal( "clear actual preloader role after child launch" );
     CloseHandle( info.hThread );
     child.process = info.hProcess; child.pid = info.dwProcessId; child.role = role;
     if (!ConnectNamedPipe( child.pipe, NULL ) && GetLastError() != ERROR_PIPE_CONNECTED)
@@ -497,6 +649,10 @@ static struct packet request_range( struct child *child, unsigned int command, u
             "token=%I64u generation=%I64u mapping=%I64u reads=%u faults=%u native_dead=%u\n", child->pid, command,
             packet.status, packet.value, packet.state, packet.lease_status,
             packet.token, packet.generation, packet.mapping_id, packet.count, packet.faults, packet.native_dead );
+    if (command == CMD_BEGIN_ACQUIRE && !packet.status)
+        InterlockedExchange( &loop_observation->acquire_go, 1 );
+    if (command == CMD_MUTATION_BEGIN && !packet.status)
+        InterlockedExchange( &loop_observation->mutation_go, 1 );
     return packet;
 }
 static struct packet request( struct child *child, unsigned int command, unsigned int value, DWORD target_pid )
@@ -589,6 +745,19 @@ static void marker_create( const char *name, const char *phase )
     if (file == INVALID_HANDLE_VALUE) fatal( "create native test marker" );
     CloseHandle( file );
 }
+static void marker_identity( const char *phase, DWORD pid, DWORD tid )
+{
+    char path[MAX_PATH], identity[64];
+    DWORD count, length;
+    HANDLE file;
+    marker_path( path, "armed", phase );
+    length = sprintf( identity, "%04lx %04lx\n", pid, tid );
+    file = CreateFileA( path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+    if (file == INVALID_HANDLE_VALUE || !WriteFile( file, identity, length, &count, NULL ) || count != length)
+        fatal( "write authoritative cancellation identity marker" );
+    CloseHandle( file );
+}
 static void marker_wait( const char *name, const char *phase )
 {
     char path[MAX_PATH];
@@ -621,10 +790,9 @@ static void revoke_ack_barrier( struct child *executor, struct child *target )
     marker_create( "gate", "revoke" );
     operation( target, CMD_MUTATION_BEGIN, PAGE_READONLY, "start target protection asynchronously" );
     marker_wait( "entered", "revoke" );
-    packet = request( target, CMD_MUTATION_POLL, 0, 0 );
-    check( packet.status == (unsigned int)STATUS_PENDING,
+    check( !loop_observation->mutation_done,
            "target mutation cannot complete while native revoke and ACK are withheld" );
-    read_value( target, 0x71, "withheld revoke preserves target's previous accessible byte" );
+    check( !loop_observation->completed, "withheld revoke leaves mutation completion unpublished" );
     before = InterlockedCompareExchange( &loop_observation->reads, 0, 0 );
     Sleep( 20 );
     check( InterlockedCompareExchange( &loop_observation->reads, 0, 0 ) > before &&
@@ -661,50 +829,100 @@ static void rejected_executor_vm( struct child *executor, struct child *target )
                "rejected executor VM operation preserves live lease identity and generation" );
     }
 }
-static void queued_apc_thread_death( struct child *executor, struct child *target )
+/* Process-wide system APC routing does not guarantee that a suspended
+ * auxiliary thread receives a particular MAP/REVOKE. This fixture checks
+ * surviving-process lifetime without claiming deterministic queued-APC
+ * cancellation. The separate native-barrier cases below test that contract. */
+static void consumer_thread_lifetime( struct child *executor, struct child *target )
 {
-    struct packet packet;
-    DWORD start;
-    operation( executor, CMD_SUSPENDED_CREATE, 0, "create suspended consumer MAP APC recipient" );
-    packet = request( executor, CMD_BEGIN_ACQUIRE, FILE_READ_DATA | FILE_WRITE_DATA, target->pid );
-    check( !packet.status, "pending MAP queued to suspended consumer thread" );
-    if (packet.status) fatal( "begin suspended recipient acquire" );
-    operation( executor, CMD_SUSPENDED_KILL, 0, "kill suspended MAP recipient while main consumer thread survives" );
-    packet = request( executor, CMD_END_ACQUIRE, 0, 0 );
-    check( !packet.status && packet.state == PRIVATE_MAPPING_LEASE_REVOKED &&
-           packet.lease_status == (unsigned int)STATUS_CANCELLED,
-           "cancelled queued MAP drains counts and signals revoked lease readiness" );
-    drop( executor );
+    operation( executor, CMD_SUSPENDED_CREATE, 0, "create auxiliary consumer thread before admission" );
+    operation( executor, CMD_SUSPENDED_KILL, 0, "terminate auxiliary thread while consumer main survives" );
     acquire( executor, target, FILE_READ_DATA | FILE_WRITE_DATA );
-    read_value( executor, 0x71, "surviving consumer later acquires ordinary live view" );
-    operation( executor, CMD_SUSPENDED_CREATE, 0, "create suspended consumer REVOKE APC recipient" );
-    memset( &packet, 0, sizeof(packet) ); packet.command = CMD_CPU_BARRIER;
-    InterlockedExchange( &loop_observation->cpu_active, 0 );
-    InterlockedExchange( &loop_observation->release_cpu, 0 );
-    pipe_transfer( executor->pipe, &packet, TRUE );
-    start = GetTickCount();
-    while (!InterlockedCompareExchange( &loop_observation->cpu_active, 0, 0 ) &&
-           GetTickCount() - start < TIMEOUT) Sleep( 1 );
-    if (!loop_observation->cpu_active) fatal( "executor main failed to enter CPU barrier" );
-    operation( target, CMD_MUTATION_BEGIN, PAGE_READONLY, "start revoke while only suspended consumer accepts APC wait" );
-    start = GetTickCount();
-    do
-    {
-        packet = request( target, CMD_OWNER_STATE, 0, 0 );
-        if (packet.status) fatal( "query owner fence during queued revoke recipient test" );
-        if (!packet.state) Sleep( 1 );
-    } while (!packet.state && GetTickCount() - start < 1000);
-    check( packet.state, "owner fence is active with REVOKE queued to suspended thread" );
-    InterlockedExchange( &loop_observation->release_cpu, 1 );
-    pipe_transfer( executor->pipe, &packet, FALSE );
-    check( !packet.status && packet.command == CMD_CPU_BARRIER, "consumer main leaves CPU barrier alive" );
-    operation( executor, CMD_SUSPENDED_KILL, 0, "kill suspended REVOKE recipient while main thread survives" );
-    operation( target, CMD_MUTATION_WAIT, 0, "cancelled queued REVOKE requeues and drains on surviving consumer" );
+    read_value( executor, 0x71, "surviving consumer acquires ordinary live view after auxiliary thread exit" );
+    operation( executor, CMD_SUSPENDED_CREATE, 0, "create auxiliary consumer thread while lease is live" );
+    operation( executor, CMD_SUSPENDED_KILL, 0, "auxiliary thread exit does not destroy process-owned live lease" );
+    read_value( executor, 0x71, "consumer ordinary pointer stays coherent after auxiliary thread exit" );
+    operation( target, CMD_PROTECT, PAGE_READONLY, "owner mutation revokes surviving consumer after auxiliary thread exit" );
     check( WaitForSingleObject( executor->process, 0 ) == WAIT_TIMEOUT,
-           "consumer process stays live; queued APC cleanup cannot use process-death shortcut" );
-    read_value( executor, PROBE_FAULT, "surviving consumer ordinary pointer faults after requeued revoke" );
+           "surviving consumer was not terminated as a revocation shortcut" );
+    read_value( executor, PROBE_FAULT, "surviving consumer pointer faults after owner mutation" );
     drop( executor );
-    operation( target, CMD_PROTECT, PAGE_READWRITE, "restore target after queued consumer thread death" );
+    operation( target, CMD_PROTECT, PAGE_READWRITE, "restore target after consumer thread lifetime case" );
+}
+static void queued_recipient_cancel( struct child *target, unsigned int phase )
+{
+    struct child executor = spawn_child( "executor", 20 + phase );
+    struct packet packet;
+    const char *name = phase ? "revoke" : "map";
+    marker_delete( "parked", name ); marker_delete( "kill", name );
+    marker_delete( "queued", name ); marker_delete( "verified", name ); marker_delete( "armed", name );
+    if (phase) acquire( &executor, target, FILE_READ_DATA | FILE_WRITE_DATA );
+    packet = request_range( &executor, CMD_CANCEL_BEGIN, FILE_READ_DATA | FILE_WRITE_DATA,
+                            target->pid, phase, 0 );
+    check( !packet.status && packet.count, "cancellation fixture advertises exact oldest recipient TID" );
+    if (packet.status || !packet.count) fatal( "begin native recipient barrier" );
+    marker_identity( name, executor.pid, packet.count );
+    printf( "a1b-live-private-view: cancellation-armed op=%s recipient_pid=%04lx recipient_tid=%04x\n",
+            phase ? "REVOKE" : "MAP", executor.pid, packet.count );
+    marker_wait( "parked", name );
+    if (phase)
+    {
+        operation( target, CMD_MUTATION_BEGIN, PAGE_READONLY, "start owner mutation for queued REVOKE cancellation" );
+        marker_wait( "queued", name );
+        {
+            DWORD start = GetTickCount();
+            while (!loop_observation->owner_updating && GetTickCount() - start < 1000) Sleep( 1 );
+        }
+        check( loop_observation->owner_updating && !loop_observation->mutation_done,
+               "queued REVOKE leaves authoritative owner fence pending before recipient death" );
+        if (!loop_observation->owner_updating || loop_observation->mutation_done)
+            fatal( "queued REVOKE did not preserve owner fence" );
+        marker_create( "verified", name );
+    }
+    packet = request( &executor, CMD_CANCEL_END, 0, 0 );
+    check( !packet.status, "survivor command controller responds after queued recipient death" );
+    check( WaitForSingleObject( executor.process, 0 ) == WAIT_TIMEOUT,
+           "queued recipient cancellation preserves surviving executor process" );
+    if (!phase)
+    {
+        check( !packet.status && packet.state == PRIVATE_MAPPING_LEASE_REVOKED &&
+               packet.lease_status == (unsigned int)STATUS_CANCELLED,
+               "queued MAP recipient death cancels lease instead of admitting an alias" );
+    }
+    else
+    {
+        operation( target, CMD_MUTATION_WAIT, 0, "owner mutation drains after REVOKE retry to survivor and native ACK" );
+        packet = request( &executor, CMD_QUERY, 0, 0 );
+        check( !packet.status && packet.state == PRIVATE_MAPPING_LEASE_REVOKED,
+               "cancelled queued REVOKE ultimately reaches acknowledged revoked lease" );
+    }
+    read_value( &executor, PROBE_FAULT, "queued recipient cancellation leaves no readable alias" );
+    write_value( &executor, 0x96, PROBE_FAULT, "queued recipient cancellation leaves no writable alias" );
+    drop( &executor );
+    if (phase) operation( target, CMD_PROTECT, PAGE_READWRITE, "restore target after queued REVOKE cancellation" );
+    acquire( &executor, target, FILE_READ_DATA | FILE_WRITE_DATA );
+    read_value( &executor, 0x41, "survivor acquires healthy later lease after queued cancellation" );
+    drop( &executor ); exit_child( &executor );
+}
+static int cancellation_main( unsigned int phases )
+{
+    struct child target;
+    HANDLE observation;
+    char name[128];
+    sprintf( name, "a1b-live-view-observation-%lu", GetCurrentProcessId() );
+    observation = CreateFileMappingA( INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+                                     sizeof(*loop_observation), name );
+    if (!observation || !(loop_observation = MapViewOfFile( observation, FILE_MAP_ALL_ACCESS, 0, 0, 0 )))
+        fatal( "create cancellation observation" );
+    target = spawn_child( "target", 19 );
+    operation( &target, CMD_ALLOC, 0x41, "target allocates coherent backing for cancellation cases" );
+    if (phases & 1) queued_recipient_cancel( &target, 0 );
+    if (phases & 2) queued_recipient_cancel( &target, 1 );
+    operation( &target, CMD_FREE, 0, "target releases backing after queued cancellation cases" );
+    exit_child( &target );
+    UnmapViewOfFile( loop_observation ); CloseHandle( observation );
+    printf( "a1b-live-private-view: %ld checks, %ld failures (queued cancellation)\n", checks, failures );
+    return !!failures;
 }
 static void pending_acquire_race( struct child *executor, struct child *target )
 {
@@ -714,20 +932,17 @@ static void pending_acquire_race( struct child *executor, struct child *target )
     marker_delete( "entered", "map" ); marker_delete( "release", "map" );
     marker_create( "gate", "map" );
     packet = request( executor, CMD_BEGIN_ACQUIRE, FILE_READ_DATA | FILE_WRITE_DATA, target->pid );
-    check( !packet.status, "server records pending lease before native map gate" );
+    check( !packet.status, "start asynchronous lease acquisition before native map gate" );
     if (packet.status) fatal( "begin gated acquire" );
     marker_wait( "entered", "map" );
     operation( target, CMD_MUTATION_BEGIN, PAGE_READONLY, "start target mutation while lease MAP remains pending" );
     start = GetTickCount();
     do
     {
-        packet = request( target, CMD_OWNER_STATE, 0, 0 );
-        if (packet.status) fatal( "query authoritative owner transaction fence" );
-        if (!packet.state) Sleep( 1 );
-    } while (!packet.state && GetTickCount() - start < 1000);
-    check( packet.state, "authoritative owner transaction fences pending acquisition before map resumes" );
-    packet = request( target, CMD_MUTATION_POLL, 0, 0 );
-    check( packet.status == (unsigned int)STATUS_PENDING,
+        if (!loop_observation->owner_updating) Sleep( 1 );
+    } while (!loop_observation->owner_updating && GetTickCount() - start < 1000);
+    check( loop_observation->owner_updating, "authoritative owner transaction fences pending acquisition before map resumes" );
+    check( !loop_observation->mutation_done,
            "owner mutation waits for pending lease revocation" );
     marker_create( "release", "map" );
     packet = request( executor, CMD_END_ACQUIRE, 0, 0 );
@@ -818,7 +1033,26 @@ static int parent_main(void)
     operation( &executor, CMD_COLLISION_REMOVE, 0, "remove owned native collision and restore noaccess reservation" );
     read_value( &executor, PROBE_FAULT, "removed collision leaves original guest range inaccessible" );
     injected_map_failure( &executor, &a );
+    {
+        struct packet packet = request( &executor, CMD_DENIED_ACQUIRE, 0, a.pid );
+        check( packet.status == (unsigned int)STATUS_ACCESS_DENIED,
+               "insufficient target process handle rights deny alias admission" );
+        memset( &packet, 0, sizeof(packet) );
+        packet.target_pid = a.pid; packet.value = FILE_READ_DATA;
+        check( acquire_lease( &packet, FALSE ) == STATUS_NOT_SUPPORTED,
+               "ordinary default-mode consumer cannot acquire managed target alias" );
+    }
     initial = acquire( &executor, &a, FILE_READ_DATA | FILE_WRITE_DATA );
+    {
+        struct packet packet = request( &executor, CMD_STALE_QUERY, 0, 0 );
+        check( packet.status == (unsigned int)STATUS_INVALID_PARAMETER, "stale lease token is rejected" );
+        packet = request( &executor, CMD_STALE_QUERY, 1, 0 );
+        check( packet.status == (unsigned int)STATUS_INVALID_PARAMETER, "stale lease generation is rejected" );
+        packet = request( &executor, CMD_QUERY, 0, 0 );
+        check( !packet.status && packet.state == PRIVATE_MAPPING_LEASE_LIVE &&
+               packet.token == initial.token && packet.generation == initial.generation,
+               "rejected stale requests preserve the acknowledged live lease" );
+    }
     read_value( &executor, 0x41, "ordinary executor pointer sees A's live byte" );
     {
         struct packet packet = request_range( &executor, CMD_READ, 0, 0, PROBE_SIZE - 1, 0 );
@@ -849,7 +1083,7 @@ static int parent_main(void)
     read_value( &a, 0x71, "failed read-only alias write preserves target bytes" );
     drop( &executor );
 
-    queued_apc_thread_death( &executor, &a );
+    consumer_thread_lifetime( &executor, &a );
     pending_acquire_race( &executor, &a );
     revoke_ack_barrier( &executor, &a );
     acquire( &executor, &a, FILE_READ_DATA | FILE_WRITE_DATA );
@@ -953,7 +1187,13 @@ static int parent_main(void)
     }
     drop( &executor );
     acquire( &executor, &b, FILE_READ_DATA | FILE_WRITE_DATA );
+    operation( &b, CMD_WATCH_NATIVE_PID, executor.native_pid, "watch original executor Linux lifetime" );
     exit_child( &executor );
+    {
+        struct packet packet = request( &b, CMD_PROTECT, PAGE_READWRITE, 0 );
+        check( !packet.status && packet.native_dead,
+               "old consumer lease drains only after pidfd-confirmed native death" );
+    }
     injected_revoke_failure( &b );
     operation( &b, CMD_FREE, 0, "target release after OS-confirmed executor death never hangs" );
     exit_child( &b );
@@ -961,9 +1201,40 @@ static int parent_main(void)
     printf( "a1b-live-private-view: %ld checks, %ld failures\n", checks, failures );
     return !!failures;
 }
+static int backing_disabled_main(void)
+{
+    struct child target, executor;
+    struct packet packet;
+    HANDLE observation;
+    char name[128];
+    if (!getenv( "A1B_DISABLE_BACKING" )) fatal( "negative fixture requires backing opt-in absent" );
+    sprintf( name, "a1b-live-view-observation-%lu", GetCurrentProcessId() );
+    observation = CreateFileMappingA( INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+                                     sizeof(*loop_observation), name );
+    if (!observation || !(loop_observation = MapViewOfFile( observation, FILE_MAP_ALL_ACCESS, 0, 0, 0 )))
+        fatal( "create negative fixture observation" );
+    target = spawn_child( "target", 1 ); executor = spawn_child( "executor", 2 );
+    operation( &target, CMD_ALLOC, 0x41, "backing-disabled target ordinary private allocation works" );
+    packet = request( &executor, CMD_ACQUIRE, FILE_READ_DATA | FILE_WRITE_DATA, target.pid );
+    check( packet.status == (unsigned int)STATUS_NOT_FOUND,
+           "backing default-off creates no eligible foreign mapping" );
+    if (!packet.status) fatal( "disabled backing unexpectedly admitted a lease" );
+    read_value( &executor, PROBE_FAULT, "backing-disabled executor ordinary read stays inaccessible" );
+    write_value( &executor, 0x99, PROBE_FAULT, "backing-disabled executor ordinary write stays inaccessible" );
+    read_value( &target, 0x41, "denied default-off admission preserves target bytes" );
+    operation( &target, CMD_FREE, 0, "backing-disabled target releases normally" );
+    exit_child( &executor ); exit_child( &target );
+    UnmapViewOfFile( loop_observation ); CloseHandle( observation );
+    printf( "a1b-live-private-view: %ld checks, %ld failures (backing default-off)\n", checks, failures );
+    return !!failures;
+}
 int main( int argc, char **argv )
 {
     setvbuf( stdout, NULL, _IONBF, 0 );
+    if (argc == 2 && !strcmp( argv[1], "--cancel-queued" )) return cancellation_main( 3 );
+    if (argc == 2 && !strcmp( argv[1], "--cancel-map" )) return cancellation_main( 1 );
+    if (argc == 2 && !strcmp( argv[1], "--cancel-revoke" )) return cancellation_main( 2 );
+    if (argc == 2 && !strcmp( argv[1], "--backing-off" )) return backing_disabled_main();
     if (argc == 4) return child_main( argv[1], argv[2], argv[3] );
     if (argc != 1) return 2;
     return parent_main();

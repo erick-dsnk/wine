@@ -2928,7 +2928,9 @@ static BOOL private_guest_reservation( void *base, size_t size )
     LIST_FOR_EACH_ENTRY( area, &reserved_areas, struct reserved_area, entry )
         if ((ULONG_PTR)area->base <= cursor && area->size >= limit - (ULONG_PTR)area->base)
         { owned = TRUE; break; }
-    if (!owned || !(file = fopen( "/proc/self/maps", "r" ))) return FALSE;
+    /* /proc/self resolves through the thread-group leader, which may have
+     * exited while this surviving thread still owns the shared address space. */
+    if (!owned || !(file = fopen( "/proc/thread-self/maps", "r" ))) return FALSE;
     while (fgets( line, sizeof(line), file ))
     {
         if (sscanf( line, "%lx-%lx %4s %lx %x:%x %lu", &start, &end, perms, &offset,
@@ -3029,7 +3031,7 @@ void virtual_private_mapping_apc( const union apc_call *call )
 #endif
     if (mapped != base)
     {
-        status = mapped == MAP_FAILED ? errno_to_status( errno ) : STATUS_NOT_SUPPORTED;
+        status = mapped == MAP_FAILED ? (errno == ENOMEM ? STATUS_NO_MEMORY : errno_to_status( errno )) : STATUS_NOT_SUPPORTED;
         if (mapped != MAP_FAILED) munmap( mapped, size );
         /* Restore only still-free pages; do not replace a native collision. */
 #ifdef MAP_FIXED_NOREPLACE

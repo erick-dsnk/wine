@@ -92,14 +92,52 @@ struct thread_apc
     struct object      *owner;    /* object that queued this apc */
     struct reserve     *reserve;  /* reserve object associated with apc object */
     int                 executed; /* has it been executed by the client? */
+    unsigned __int64    trace_id; /* server-local private APC correlation */
+    process_id_t        recipient_pid;
+    thread_id_t         recipient_tid;
+    int                 recipient_unix_pid, recipient_unix_tid;
     union apc_call      call;     /* call arguments */
     union apc_result    result;   /* call results once executed */
 };
 
+static unsigned __int64 private_apc_trace_serial;
+static unsigned __int64 private_apc_trace_sequence;
+static int private_apc_trace_enabled = -1;
+static inline int is_thread_suspended( struct thread *thread );
+
+/* Use wineserver's ordinary debug switch (+server), or opt into only these
+ * experimental diagnostics. Retain IDs rather than a thread reference so
+ * teardown is observable; tracing has no scheduling side effects. */
+static void trace_private_apc( struct thread_apc *apc, struct thread *thread,
+                               const char *event, const char *detail )
+{
+    if (apc->call.type != APC_PRIVATE_MAPPING) return;
+    if (private_apc_trace_enabled == -1)
+    {
+        const char *value = getenv( "WINE_PRIVATE_MAPPING_TRACE" );
+        private_apc_trace_enabled = value && !strcmp( value, "1" );
+    }
+    if (!debug_level && !private_apc_trace_enabled) return;
+    fprintf( stderr, "private-apc event=%s op=%s id=%llu apc=%p lease=%llu generation=%llu "
+             "handle=%04x recipient_pid=%04x recipient_tid=%04x unix_pid=%d unix_tid=%d "
+             "state=%d suspended=%d wait_flags=%08x detail=%s seq=%llu time=%llu result_type=%u\n",
+             event, apc->call.private_mapping.revoke ? "REVOKE" : "MAP",
+             (unsigned long long)apc->trace_id, apc,
+             (unsigned long long)apc->call.private_mapping.token,
+             (unsigned long long)apc->call.private_mapping.generation,
+             apc->call.private_mapping.handle, apc->recipient_pid, apc->recipient_tid,
+             apc->recipient_unix_pid, apc->recipient_unix_tid,
+             thread ? thread->state : -1,
+             thread ? is_thread_suspended( thread ) : -1,
+             thread && thread->wait ? thread->wait->flags : 0, detail,
+             (unsigned long long)++private_apc_trace_sequence, (unsigned long long)monotonic_time,
+             apc->result.type );
+}
+
 static void dump_thread_apc( struct object *obj, int verbose );
 static struct object *thread_apc_get_sync( struct object *obj );
 static void thread_apc_destroy( struct object *obj );
-static void clear_apc_queue( struct list *queue );
+static void clear_apc_queue( struct thread *thread, struct list *queue );
 
 static const struct object_ops thread_apc_ops =
 {
@@ -622,8 +660,8 @@ static void cleanup_thread( struct thread *thread )
         release_object( thread->context );
         thread->context = NULL;
     }
-    clear_apc_queue( &thread->system_apc );
-    clear_apc_queue( &thread->user_apc );
+    clear_apc_queue( thread, &thread->system_apc );
+    clear_apc_queue( thread, &thread->user_apc );
     free( thread->req_data );
     free( thread->reply_data );
     if (thread->request_fd) release_object( thread->request_fd );
@@ -719,7 +757,10 @@ static void thread_apc_destroy( struct object *obj )
         else if (apc->call.type == APC_ASYNC_IO)
             async_set_result( apc->owner, apc->call.async_io.status, 0 );
         else if (apc->call.type == APC_PRIVATE_MAPPING && !apc->executed)
+        {
+            trace_private_apc( apc, NULL, "cancelled", "destroy_unfinished" );
             private_mapping_apc_finished( apc->owner, 1 );
+        }
         release_object( apc->owner );
     }
     if (apc->sync) release_object( apc->sync );
@@ -740,6 +781,9 @@ static struct thread_apc *create_apc( struct object *owner, const union apc_call
         apc->owner       = owner;
         apc->reserve     = NULL;
         apc->executed    = 0;
+        apc->trace_id    = apc->call.type == APC_PRIVATE_MAPPING ? ++private_apc_trace_serial : 0;
+        apc->recipient_pid = apc->recipient_tid = 0;
+        apc->recipient_unix_pid = apc->recipient_unix_tid = -1;
         apc->result.type = APC_NONE;
         if (owner) grab_object( owner );
 
@@ -1460,6 +1504,7 @@ static inline int is_in_apc_wait( struct thread *thread )
 static int queue_apc( struct process *process, struct thread *thread, struct thread_apc *apc )
 {
     struct list *queue;
+    const char *route = "explicit";
 
     if (thread && thread->state == TERMINATED && process)
         thread = NULL;
@@ -1475,6 +1520,7 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
             if (is_in_apc_wait( candidate ))
             {
                 thread = candidate;
+                route = "waiting";
                 break;
             }
         }
@@ -1486,21 +1532,34 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
                 if (send_thread_signal( candidate, SIGUSR1 ))
                 {
                     thread = candidate;
+                    route = "signal";
                     break;
                 }
             }
         }
-        if (!thread) return 0;  /* nothing found */
+        if (!thread)
+        {
+            trace_private_apc( apc, NULL, "queue_failed", "no_recipient" );
+            return 0;
+        }
         if (!(queue = get_apc_queue( thread, apc->call.type ))) return 1;
     }
     else
     {
-        if (thread->state == TERMINATED) return 0;
+        if (thread->state == TERMINATED)
+        {
+            trace_private_apc( apc, thread, "queue_failed", "terminated" );
+            return 0;
+        }
         if (!(queue = get_apc_queue( thread, apc->call.type ))) return 1;
         /* send signal for system APCs if needed */
         if (queue == &thread->system_apc && list_empty( queue ) && !is_in_apc_wait( thread ))
         {
-            if (!send_thread_signal( thread, SIGUSR1 )) return 0;
+            if (!send_thread_signal( thread, SIGUSR1 ))
+            {
+                trace_private_apc( apc, thread, "queue_failed", "signal_failed" );
+                return 0;
+            }
         }
         /* cancel a possible previous APC with the same owner */
         if (apc->owner) thread_cancel_apc( thread, apc->owner, apc->call.type );
@@ -1508,6 +1567,11 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
 
     grab_object( apc );
     list_add_tail( queue, &apc->entry );
+    apc->recipient_pid = thread->process->id;
+    apc->recipient_tid = thread->id;
+    apc->recipient_unix_pid = thread->unix_pid;
+    apc->recipient_unix_tid = thread->unix_tid;
+    trace_private_apc( apc, thread, "queued", route );
     if (!list_prev( queue, &apc->entry ))  /* first one */
     {
         if (apc->call.type == APC_USER && thread->alert_sync)
@@ -1542,6 +1606,7 @@ void thread_cancel_apc( struct thread *thread, struct object *owner, enum apc_ty
     {
         if (apc->owner != owner) continue;
         list_remove( &apc->entry );
+        trace_private_apc( apc, thread, "cancelled", "owner_replaced" );
         if (apc->call.type == APC_PRIVATE_MAPPING) private_mapping_apc_finished( apc->owner, 1 );
         apc->executed = 1;
         signal_sync( apc->sync );
@@ -1562,6 +1627,7 @@ static struct thread_apc *thread_dequeue_apc( struct thread *thread, int system 
     {
         apc = LIST_ENTRY( ptr, struct thread_apc, entry );
         list_remove( ptr );
+        trace_private_apc( apc, thread, "dequeued", system ? "system" : "user" );
         if (list_empty( &thread->user_apc ) && thread->alert_sync)
             reset_inproc_sync( thread->alert_sync );
     }
@@ -1569,7 +1635,7 @@ static struct thread_apc *thread_dequeue_apc( struct thread *thread, int system 
 }
 
 /* clear an APC queue, cancelling all the APCs on it */
-static void clear_apc_queue( struct list *queue )
+static void clear_apc_queue( struct thread *thread, struct list *queue )
 {
     struct list *ptr;
 
@@ -1577,6 +1643,7 @@ static void clear_apc_queue( struct list *queue )
     {
         struct thread_apc *apc = LIST_ENTRY( ptr, struct thread_apc, entry );
         list_remove( &apc->entry );
+        trace_private_apc( apc, thread, "cancelled", "thread_queue_cleared" );
         if (apc->call.type == APC_PRIVATE_MAPPING) private_mapping_apc_finished( apc->owner, 1 );
         apc->executed = 1;
         signal_sync( apc->sync );
@@ -2088,6 +2155,7 @@ DECL_HANDLER(select)
         if (!(apc = (struct thread_apc *)get_handle_obj( current->process, req->prev_apc,
                                                          0, &thread_apc_ops ))) return;
         apc->result = *result;
+        trace_private_apc( apc, current, "completed", "client_result" );
         if (apc->call.type == APC_PRIVATE_MAPPING) private_mapping_apc_finished( apc->owner, 0 );
         apc->executed = 1;
         if (apc->result.type == APC_CREATE_THREAD)  /* transfer the handle to the caller process */
@@ -2117,9 +2185,11 @@ DECL_HANDLER(select)
         if ((reply->apc_handle = alloc_handle( current->process, apc, SYNCHRONIZE, 0 )))
         {
             set_reply_data( &apc->call, sizeof(apc->call) );
+            trace_private_apc( apc, current, "delivered", "client_handle" );
         }
         else
         {
+            trace_private_apc( apc, current, "cancelled", "handle_allocation_failed" );
             if (apc->call.type == APC_PRIVATE_MAPPING) private_mapping_apc_finished( apc->owner, 1 );
             apc->executed = 1;
             signal_sync( apc->sync );
