@@ -128,6 +128,7 @@ static void dump_init_process_done_request( const struct init_process_done_reque
     dump_uint64( " teb=", &req->teb );
     dump_uint64( ", peb=", &req->peb );
     dump_uint64( ", ldt_copy=", &req->ldt_copy );
+    fprintf( stderr, ", managed_role=%08x", req->managed_role );
 }
 
 static void dump_init_process_done_reply( const struct init_process_done_reply *req )
@@ -3586,11 +3587,13 @@ static void dump_begin_private_mapping_change_request( const struct begin_privat
     dump_uint64( ", size=", &req->size );
     dump_uint64( ", generation=", &req->generation );
     fprintf( stderr, ", operation=%08x", req->operation );
+    fprintf( stderr, ", vprot=%08x", req->vprot );
 }
 
 static void dump_begin_private_mapping_change_reply( const struct begin_private_mapping_change_reply *req )
 {
     dump_uint64( " generation=", &req->generation );
+    fprintf( stderr, ", ready=%04x", req->ready );
 }
 
 static void dump_finish_private_mapping_change_request( const struct finish_private_mapping_change_request *req )
@@ -3627,6 +3630,81 @@ static void dump_acquire_private_mapping_request( const struct acquire_private_m
     dump_uint64( ", address=", &req->address );
     dump_uint64( ", size=", &req->size );
     fprintf( stderr, ", access=%08x", req->access );
+}
+
+static void dump_acquire_private_mapping_reply( const struct acquire_private_mapping_reply *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    fprintf( stderr, ", ready=%04x", req->ready );
+    dump_uint64( ", token=", &req->token );
+    dump_uint64( ", generation=", &req->generation );
+    dump_uint64( ", mapping_id=", &req->mapping_id );
+}
+
+static void dump_lookup_private_mapping_request( const struct lookup_private_mapping_request *req )
+{
+    dump_uint64( " address=", &req->address );
+}
+
+static void dump_lookup_private_mapping_reply( const struct lookup_private_mapping_reply *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    dump_uint64( ", base=", &req->base );
+    dump_uint64( ", size=", &req->size );
+    dump_uint64( ", generation=", &req->generation );
+    dump_uint64( ", mapping_id=", &req->mapping_id );
+    dump_varargs_bytes( ", pages=", cur_size );
+}
+
+static void dump_query_private_mapping_lease_request( const struct query_private_mapping_lease_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    dump_uint64( ", token=", &req->token );
+    dump_uint64( ", generation=", &req->generation );
+}
+
+static void dump_query_private_mapping_lease_reply( const struct query_private_mapping_lease_reply *req )
+{
+    fprintf( stderr, " state=%08x", req->state );
+    fprintf( stderr, ", status=%08x", req->status );
+    fprintf( stderr, ", access=%08x", req->access );
+    dump_uint64( ", base=", &req->base );
+    dump_uint64( ", size=", &req->size );
+    dump_varargs_bytes( ", pages=", cur_size );
+}
+
+static void dump_confirm_private_mapping_lease_request( const struct confirm_private_mapping_lease_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    dump_uint64( ", token=", &req->token );
+    dump_uint64( ", generation=", &req->generation );
+    fprintf( stderr, ", status=%08x", req->status );
+}
+
+static void dump_release_private_mapping_lease_request( const struct release_private_mapping_lease_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    dump_uint64( ", token=", &req->token );
+    dump_uint64( ", generation=", &req->generation );
+}
+
+static void dump_release_private_mapping_lease_reply( const struct release_private_mapping_lease_reply *req )
+{
+    fprintf( stderr, " ready=%04x", req->ready );
+}
+
+static void dump_ack_private_mapping_revoke_request( const struct ack_private_mapping_revoke_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    dump_uint64( ", token=", &req->token );
+    dump_uint64( ", generation=", &req->generation );
+}
+
+static void dump_get_private_mapping_fd_request( const struct get_private_mapping_fd_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    dump_uint64( ", token=", &req->token );
+    dump_uint64( ", generation=", &req->generation );
 }
 
 typedef void (*dump_func)( const void *req );
@@ -3948,6 +4026,12 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_finish_private_mapping_change_request,
     (dump_func)dump_query_private_mapping_request,
     (dump_func)dump_acquire_private_mapping_request,
+    (dump_func)dump_lookup_private_mapping_request,
+    (dump_func)dump_query_private_mapping_lease_request,
+    (dump_func)dump_confirm_private_mapping_lease_request,
+    (dump_func)dump_release_private_mapping_lease_request,
+    (dump_func)dump_ack_private_mapping_revoke_request,
+    (dump_func)dump_get_private_mapping_fd_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4266,6 +4350,12 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_begin_private_mapping_change_reply,
     (dump_func)dump_finish_private_mapping_change_reply,
     (dump_func)dump_query_private_mapping_reply,
+    (dump_func)dump_acquire_private_mapping_reply,
+    (dump_func)dump_lookup_private_mapping_reply,
+    (dump_func)dump_query_private_mapping_lease_reply,
+    NULL,
+    (dump_func)dump_release_private_mapping_lease_reply,
+    NULL,
     NULL,
 };
 
@@ -4586,6 +4676,12 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "finish_private_mapping_change",
     "query_private_mapping",
     "acquire_private_mapping",
+    "lookup_private_mapping",
+    "query_private_mapping_lease",
+    "confirm_private_mapping_lease",
+    "release_private_mapping_lease",
+    "ack_private_mapping_revoke",
+    "get_private_mapping_fd",
 };
 
 static const struct

@@ -111,6 +111,27 @@
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
+#endif
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS 1033
+#endif
+#ifndef F_SEAL_SEAL
+#define F_SEAL_SEAL 0x0001
+#endif
+#ifndef F_SEAL_SHRINK
+#define F_SEAL_SHRINK 0x0002
+#endif
+#ifndef F_SEAL_GROW
+#define F_SEAL_GROW 0x0004
+#endif
+#ifndef F_SEAL_WRITE
+#define F_SEAL_WRITE 0x0008
+#endif
 
 static int managed_role;
 static const struct wine_managed_layout managed_target_layout =
@@ -119,7 +140,7 @@ static const struct wine_managed_layout managed_target_layout =
     WINE_MANAGED_GUEST_START, WINE_MANAGED_GUEST_END
 };
 
-static const struct wine_managed_executor_layout managed_executor_layout =
+static struct wine_managed_executor_layout managed_executor_layout =
 {
     { WINE_MANAGED_EXECUTOR_VERSION, WINE_MANAGED_LAYOUT_EXECUTOR,
       WINE_MANAGED_GUEST_START, WINE_MANAGED_GUEST_END },
@@ -127,7 +148,8 @@ static const struct wine_managed_executor_layout managed_executor_layout =
     WINE_MANAGED_HOST_START, WINE_MANAGED_HOST_END,
     WINE_MANAGED_HOST_NTDLL_START, WINE_MANAGED_HOST_NTDLL_END,
     WINE_MANAGED_KUSER_START, WINE_MANAGED_KUSER_END,
-    WINE_MANAGED_DISPATCH_START, WINE_MANAGED_DISPATCH_END
+    WINE_MANAGED_DISPATCH_START, WINE_MANAGED_DISPATCH_END,
+    -1, WINE_MANAGED_EXECUTOR_RESERVATION_FILE_BACKED_SEALED
 };
 
 static struct wine_preload_info preload_info[] =
@@ -423,6 +445,15 @@ SYSCALL_FUNC( wld_write, 1 /* SYS_write */ );
 
 int wld_open( const char *name, int flags );
 SYSCALL_FUNC( wld_open, 2 /* SYS_open */ );
+
+int wld_memfd_create( const char *name, unsigned int flags );
+SYSCALL_FUNC( wld_memfd_create, 319 /* SYS_memfd_create */ );
+
+int wld_ftruncate( int fd, off_t length );
+SYSCALL_FUNC( wld_ftruncate, 77 /* SYS_ftruncate */ );
+
+int wld_fcntl( int fd, int command, long argument );
+SYSCALL_FUNC( wld_fcntl, 72 /* SYS_fcntl */ );
 
 int wld_close( int fd );
 SYSCALL_FUNC( wld_close, 3 /* SYS_close */ );
@@ -837,6 +868,35 @@ static void reserve_managed_range( void *start, size_t size, const char *name )
         fatal_error( "preloader: managed %s reservation failed or collided\n", name );
     }
 }
+
+/* Give the executor a sealed, identifiable mapping to restore after a view lease. */
+static int reserve_managed_executor_guest_range( void )
+{
+    const size_t size = WINE_MANAGED_GUEST_END - WINE_MANAGED_GUEST_START;
+    const int seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    int fd;
+    void *ptr;
+
+    fd = wld_memfd_create( "wine-managed-executor-guest", MFD_CLOEXEC | MFD_ALLOW_SEALING );
+    if (fd == -1) return -1;
+    if (wld_ftruncate( fd, (off_t)size ) == -1 || wld_fcntl( fd, F_ADD_SEALS, seals ) == -1)
+    {
+        wld_close( fd );
+        return -1;
+    }
+
+    ptr = wld_mmap( (void *)WINE_MANAGED_GUEST_START, size, PROT_NONE,
+                    MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_NORESERVE, fd, 0 );
+    if (ptr != (void *)WINE_MANAGED_GUEST_START)
+    {
+        if (ptr != (void *)-1) wld_munmap( ptr, size );
+        wld_close( fd );
+        return -1;
+    }
+
+    managed_executor_layout.guest_reservation_fd = fd;
+    return 0;
+}
 #endif
 
 static void reserve_managed_layout( const char *setting, const char *reserve )
@@ -849,8 +909,13 @@ static void reserve_managed_layout( const char *setting, const char *reserve )
     else fatal_error( "preloader: unsupported WINE_MANAGED_LAYOUT value\n" );
     if (page_size != 4096) fatal_error( "preloader: unsupported managed page size\n" );
     validate_managed_image_range( reserve );
-    reserve_managed_range( (void *)WINE_MANAGED_GUEST_START,
-                           WINE_MANAGED_GUEST_END - WINE_MANAGED_GUEST_START, "guest" );
+    if (managed_role == WINE_MANAGED_LAYOUT_EXECUTOR)
+    {
+        if (reserve_managed_executor_guest_range())
+            fatal_error( "preloader: sealed managed executor guest reservation failed or collided\n" );
+    }
+    else reserve_managed_range( (void *)WINE_MANAGED_GUEST_START,
+                                WINE_MANAGED_GUEST_END - WINE_MANAGED_GUEST_START, "guest" );
     preload_info[0].addr = (void *)WINE_MANAGED_GUEST_START;
     preload_info[0].size = WINE_MANAGED_GUEST_END - WINE_MANAGED_GUEST_START;
     if (managed_role == WINE_MANAGED_LAYOUT_EXECUTOR)

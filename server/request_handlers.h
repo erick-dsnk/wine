@@ -322,6 +322,12 @@ DECL_HANDLER(begin_private_mapping_change);
 DECL_HANDLER(finish_private_mapping_change);
 DECL_HANDLER(query_private_mapping);
 DECL_HANDLER(acquire_private_mapping);
+DECL_HANDLER(lookup_private_mapping);
+DECL_HANDLER(query_private_mapping_lease);
+DECL_HANDLER(confirm_private_mapping_lease);
+DECL_HANDLER(release_private_mapping_lease);
+DECL_HANDLER(ack_private_mapping_revoke);
+DECL_HANDLER(get_private_mapping_fd);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -641,6 +647,12 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_finish_private_mapping_change,
     (req_handler)req_query_private_mapping,
     (req_handler)req_acquire_private_mapping,
+    (req_handler)req_lookup_private_mapping,
+    (req_handler)req_query_private_mapping_lease,
+    (req_handler)req_confirm_private_mapping_lease,
+    (req_handler)req_release_private_mapping_lease,
+    (req_handler)req_ack_private_mapping_revoke,
+    (req_handler)req_get_private_mapping_fd,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -731,7 +743,8 @@ C_ASSERT( sizeof(struct get_startup_info_reply) == 16 );
 C_ASSERT( offsetof(struct init_process_done_request, teb) == 16 );
 C_ASSERT( offsetof(struct init_process_done_request, peb) == 24 );
 C_ASSERT( offsetof(struct init_process_done_request, ldt_copy) == 32 );
-C_ASSERT( sizeof(struct init_process_done_request) == 40 );
+C_ASSERT( offsetof(struct init_process_done_request, managed_role) == 40 );
+C_ASSERT( sizeof(struct init_process_done_request) == 48 );
 C_ASSERT( offsetof(struct init_process_done_reply, suspend) == 8 );
 C_ASSERT( sizeof(struct init_process_done_reply) == 16 );
 C_ASSERT( offsetof(struct init_first_thread_request, unix_pid) == 12 );
@@ -2432,9 +2445,11 @@ C_ASSERT( offsetof(struct begin_private_mapping_change_request, offset) == 24 );
 C_ASSERT( offsetof(struct begin_private_mapping_change_request, size) == 32 );
 C_ASSERT( offsetof(struct begin_private_mapping_change_request, generation) == 40 );
 C_ASSERT( offsetof(struct begin_private_mapping_change_request, operation) == 48 );
+C_ASSERT( offsetof(struct begin_private_mapping_change_request, vprot) == 52 );
 C_ASSERT( sizeof(struct begin_private_mapping_change_request) == 56 );
 C_ASSERT( offsetof(struct begin_private_mapping_change_reply, generation) == 8 );
-C_ASSERT( sizeof(struct begin_private_mapping_change_reply) == 16 );
+C_ASSERT( offsetof(struct begin_private_mapping_change_reply, ready) == 16 );
+C_ASSERT( sizeof(struct begin_private_mapping_change_reply) == 24 );
 C_ASSERT( offsetof(struct finish_private_mapping_change_request, handle) == 12 );
 C_ASSERT( offsetof(struct finish_private_mapping_change_request, generation) == 16 );
 C_ASSERT( offsetof(struct finish_private_mapping_change_request, commit) == 24 );
@@ -2456,4 +2471,49 @@ C_ASSERT( offsetof(struct acquire_private_mapping_request, address) == 16 );
 C_ASSERT( offsetof(struct acquire_private_mapping_request, size) == 24 );
 C_ASSERT( offsetof(struct acquire_private_mapping_request, access) == 32 );
 C_ASSERT( sizeof(struct acquire_private_mapping_request) == 40 );
-C_ASSERT( sizeof(struct acquire_private_mapping_reply) == 8 );
+C_ASSERT( offsetof(struct acquire_private_mapping_reply, handle) == 8 );
+C_ASSERT( offsetof(struct acquire_private_mapping_reply, ready) == 12 );
+C_ASSERT( offsetof(struct acquire_private_mapping_reply, token) == 16 );
+C_ASSERT( offsetof(struct acquire_private_mapping_reply, generation) == 24 );
+C_ASSERT( offsetof(struct acquire_private_mapping_reply, mapping_id) == 32 );
+C_ASSERT( sizeof(struct acquire_private_mapping_reply) == 40 );
+C_ASSERT( offsetof(struct lookup_private_mapping_request, address) == 16 );
+C_ASSERT( sizeof(struct lookup_private_mapping_request) == 24 );
+C_ASSERT( offsetof(struct lookup_private_mapping_reply, handle) == 8 );
+C_ASSERT( offsetof(struct lookup_private_mapping_reply, base) == 16 );
+C_ASSERT( offsetof(struct lookup_private_mapping_reply, size) == 24 );
+C_ASSERT( offsetof(struct lookup_private_mapping_reply, generation) == 32 );
+C_ASSERT( offsetof(struct lookup_private_mapping_reply, mapping_id) == 40 );
+C_ASSERT( sizeof(struct lookup_private_mapping_reply) == 48 );
+C_ASSERT( offsetof(struct query_private_mapping_lease_request, handle) == 12 );
+C_ASSERT( offsetof(struct query_private_mapping_lease_request, token) == 16 );
+C_ASSERT( offsetof(struct query_private_mapping_lease_request, generation) == 24 );
+C_ASSERT( sizeof(struct query_private_mapping_lease_request) == 32 );
+C_ASSERT( offsetof(struct query_private_mapping_lease_reply, state) == 8 );
+C_ASSERT( offsetof(struct query_private_mapping_lease_reply, status) == 12 );
+C_ASSERT( offsetof(struct query_private_mapping_lease_reply, access) == 16 );
+C_ASSERT( offsetof(struct query_private_mapping_lease_reply, base) == 24 );
+C_ASSERT( offsetof(struct query_private_mapping_lease_reply, size) == 32 );
+C_ASSERT( sizeof(struct query_private_mapping_lease_reply) == 40 );
+C_ASSERT( offsetof(struct confirm_private_mapping_lease_request, handle) == 12 );
+C_ASSERT( offsetof(struct confirm_private_mapping_lease_request, token) == 16 );
+C_ASSERT( offsetof(struct confirm_private_mapping_lease_request, generation) == 24 );
+C_ASSERT( offsetof(struct confirm_private_mapping_lease_request, status) == 32 );
+C_ASSERT( sizeof(struct confirm_private_mapping_lease_request) == 40 );
+C_ASSERT( sizeof(struct confirm_private_mapping_lease_reply) == 8 );
+C_ASSERT( offsetof(struct release_private_mapping_lease_request, handle) == 12 );
+C_ASSERT( offsetof(struct release_private_mapping_lease_request, token) == 16 );
+C_ASSERT( offsetof(struct release_private_mapping_lease_request, generation) == 24 );
+C_ASSERT( sizeof(struct release_private_mapping_lease_request) == 32 );
+C_ASSERT( offsetof(struct release_private_mapping_lease_reply, ready) == 8 );
+C_ASSERT( sizeof(struct release_private_mapping_lease_reply) == 16 );
+C_ASSERT( offsetof(struct ack_private_mapping_revoke_request, handle) == 12 );
+C_ASSERT( offsetof(struct ack_private_mapping_revoke_request, token) == 16 );
+C_ASSERT( offsetof(struct ack_private_mapping_revoke_request, generation) == 24 );
+C_ASSERT( sizeof(struct ack_private_mapping_revoke_request) == 32 );
+C_ASSERT( sizeof(struct ack_private_mapping_revoke_reply) == 8 );
+C_ASSERT( offsetof(struct get_private_mapping_fd_request, handle) == 12 );
+C_ASSERT( offsetof(struct get_private_mapping_fd_request, token) == 16 );
+C_ASSERT( offsetof(struct get_private_mapping_fd_request, generation) == 24 );
+C_ASSERT( sizeof(struct get_private_mapping_fd_request) == 32 );
+C_ASSERT( sizeof(struct get_private_mapping_fd_reply) == 8 );

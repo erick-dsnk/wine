@@ -30,6 +30,10 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <poll.h>
+#ifdef __linux__
+# include <sys/syscall.h>
+#endif
 #ifdef HAVE_LINUX_MEMFD_H
 # include <linux/memfd.h>
 #endif
@@ -225,10 +229,32 @@ struct private_mapping
     struct object obj;
     struct mapping *mapping;
     struct process *owner;
+    struct list entry, leases;
+    struct event *ready;
+    unsigned char *pages;
+    unsigned __int64 id;
+    unsigned int pending_vprot, exit_waiting, retired;
     client_ptr_t base, pending_base;
     mem_size_t offset, size, pending_offset, pending_size;
     unsigned __int64 generation;
     unsigned int operation, pending_operation;
+};
+
+static struct list private_mappings = LIST_INIT(private_mappings);
+static unsigned __int64 private_mapping_serial, private_lease_serial;
+
+struct private_mapping_lease
+{
+    struct object obj;
+    struct list entry;
+    struct private_mapping *mapping;
+    struct process *consumer;
+    struct event *ready;
+    struct timeout_user *death_timer;
+    obj_handle_t handle;
+    unsigned __int64 token, generation;
+    unsigned int state, status, access, apc_count;
+    int pidfd;
 };
 
 static void private_mapping_dump( struct object *obj, int verbose );
@@ -1370,6 +1396,10 @@ static void private_mapping_destroy( struct object *obj )
 {
     struct private_mapping *mapping = (struct private_mapping *)obj;
 
+    assert( list_empty( &mapping->leases ));
+    list_remove( &mapping->entry );
+    free( mapping->pages );
+    if (mapping->ready) release_object( mapping->ready );
     if (mapping->mapping) release_object( mapping->mapping );
     if (mapping->owner) release_object( mapping->owner );
 }
@@ -1389,23 +1419,184 @@ static struct private_mapping *get_private_mapping_obj( obj_handle_t handle )
     return mapping;
 }
 
+/* Leases keep the backing alive independently of owner handles. The list owns
+ * one lease reference until an explicit unmap acknowledgement or pidfd death.
+ * A process object reaching zero Wine threads is not evidence its Unix mm died. */
+static void private_lease_dump( struct object *obj, int verbose )
+{
+    struct private_mapping_lease *lease = (struct private_mapping_lease *)obj;
+    fprintf( stderr, "Private lease state=%u consumer=%p\n", lease->state, lease->consumer );
+}
+
+static void private_lease_destroy( struct object *obj )
+{
+    struct private_mapping_lease *lease = (struct private_mapping_lease *)obj;
+    assert( lease->state == PRIVATE_MAPPING_LEASE_REVOKED );
+    if (lease->death_timer) remove_timeout_user( lease->death_timer );
+    if (lease->pidfd != -1) close( lease->pidfd );
+    if (lease->ready) release_object( lease->ready );
+    if (lease->mapping) release_object( lease->mapping );
+    if (lease->consumer) release_object( lease->consumer );
+}
+
+static int private_lease_close_handle( struct object *obj, struct process *process, obj_handle_t handle )
+{
+    struct private_mapping_lease *lease = (struct private_mapping_lease *)obj;
+    /* Retain the APC routing handle through map/revoke. Process teardown still
+     * closes handles, and pidfd (never handle closure) then proves mm death. */
+    return (lease->state == PRIVATE_MAPPING_LEASE_REVOKED && !lease->apc_count) || !process->running_threads;
+}
+
+static const struct object_ops private_lease_ops =
+{
+    sizeof(struct private_mapping_lease), &no_type, private_lease_dump,
+    no_add_queue, NULL, NULL, NULL, no_signal, no_get_fd, default_get_sync,
+    default_map_access, default_get_sd, default_set_sd, no_get_full_name,
+    no_lookup_name, no_link_name, NULL, no_open_file, no_kernel_obj_list,
+    private_lease_close_handle, private_lease_destroy
+};
+
+static struct private_mapping_lease *get_private_lease( obj_handle_t handle,
+                                                       unsigned __int64 token,
+                                                       unsigned __int64 generation )
+{
+    struct private_mapping_lease *lease;
+    if (!(lease = (struct private_mapping_lease *)get_handle_obj( current->process, handle, 0,
+                                                                &private_lease_ops ))) return NULL;
+    if (lease->consumer != current->process || lease->token != token || lease->generation != generation)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        release_object( lease );
+        return NULL;
+    }
+    return lease;
+}
+
+static void private_lease_revoked( struct private_mapping_lease *lease )
+{
+    struct private_mapping *mapping = lease->mapping;
+    if (lease->state == PRIVATE_MAPPING_LEASE_REVOKED) return;
+    lease->state = PRIVATE_MAPPING_LEASE_REVOKED;
+    if (lease->status == STATUS_PENDING) lease->status = STATUS_CANCELLED;
+    if (lease->death_timer) remove_timeout_user( lease->death_timer );
+    lease->death_timer = NULL;
+    list_remove( &lease->entry );
+    if (!lease->apc_count) set_event( lease->ready );
+    if (list_empty( &mapping->leases ))
+    {
+        set_event( mapping->ready );
+        if (mapping->exit_waiting)
+        {
+            mapping->exit_waiting = 0;
+            assert( mapping->owner->private_exit_pending );
+            if (!--mapping->owner->private_exit_pending) complete_private_mapping_process_exit( mapping->owner );
+        }
+    }
+    release_object( lease ); /* list reference */
+}
+
+void private_mapping_apc_finished( struct object *obj, int cancelled )
+{
+    struct private_mapping_lease *lease = (struct private_mapping_lease *)obj;
+    assert( lease->apc_count );
+    --lease->apc_count;
+    if (cancelled && lease->state == PRIVATE_MAPPING_LEASE_PENDING)
+    {
+        lease->status = STATUS_CANCELLED;
+        private_lease_revoked( lease );
+    }
+    else if (!lease->apc_count && lease->state == PRIVATE_MAPPING_LEASE_REVOKED) set_event( lease->ready );
+}
+
+static int queue_private_lease_apc( struct private_mapping_lease *lease, int revoke )
+{
+    union apc_call call;
+    unsigned int previous = lease->apc_count;
+    memset( &call, 0, sizeof(call) );
+    call.private_mapping.type = APC_PRIVATE_MAPPING;
+    call.private_mapping.handle = lease->handle;
+    call.private_mapping.token = lease->token;
+    call.private_mapping.generation = lease->generation;
+    call.private_mapping.revoke = revoke;
+    ++lease->apc_count;
+    if (thread_queue_apc( lease->consumer, NULL, &lease->obj, &call )) return 1;
+    if (lease->apc_count > previous) --lease->apc_count;
+    return 0;
+}
+
+static void private_lease_check_death( void *private )
+{
+    struct private_mapping_lease *lease = private;
+    struct pollfd fd = { lease->pidfd, POLLIN, 0 };
+    lease->death_timer = NULL;
+    if (poll( &fd, 1, 0 ) == 1 && (fd.revents & POLLIN)) private_lease_revoked( lease );
+    else
+    {
+        if (!lease->apc_count) queue_private_lease_apc( lease, 1 );
+        lease->death_timer = add_timeout_user( -TICKS_PER_SEC / 10, private_lease_check_death, lease );
+    }
+}
+
+static void revoke_private_lease( struct private_mapping_lease *lease )
+{
+    if (lease->state >= PRIVATE_MAPPING_LEASE_REVOKING) return;
+    reset_event( lease->ready );
+    lease->state = PRIVATE_MAPPING_LEASE_REVOKING;
+    /* Queue failure is not successful revocation. Keep the lease fenced until
+     * a genuine acknowledgement or observed OS process death. */
+    queue_private_lease_apc( lease, 1 );
+    lease->death_timer = add_timeout_user( -TICKS_PER_SEC / 10, private_lease_check_death, lease );
+}
+
+int revoke_process_private_mappings( struct process *process )
+{
+    struct private_mapping *mapping;
+    struct private_mapping_lease *lease;
+    LIST_FOR_EACH_ENTRY( mapping, &private_mappings, struct private_mapping, entry )
+    {
+        if (mapping->owner == process && !list_empty( &mapping->leases ))
+        {
+            mapping->exit_waiting = 1;
+            ++process->private_exit_pending;
+            LIST_FOR_EACH_ENTRY( lease, &mapping->leases, struct private_mapping_lease, entry )
+                revoke_private_lease( lease );
+        }
+        else LIST_FOR_EACH_ENTRY( lease, &mapping->leases, struct private_mapping_lease, entry )
+            if (lease->consumer == process) revoke_private_lease( lease );
+    }
+    return process->private_exit_pending;
+}
+
 DECL_HANDLER(create_private_mapping)
 {
     const struct unicode_str name = { NULL, 0 };
     struct private_mapping *mapping;
-
     if (!req->size || (req->size & page_mask) || req->size >> 54)
     {
         set_error( STATUS_INVALID_PARAMETER );
         return;
     }
+    if (private_mapping_serial == ~(unsigned __int64)0) { set_error( STATUS_INTEGER_OVERFLOW ); return; }
     if (!(mapping = alloc_object( &private_mapping_ops ))) return;
     mapping->mapping = NULL;
     mapping->owner = NULL;
+    mapping->ready = NULL;
+    mapping->pages = NULL;
+    list_init( &mapping->leases );
+    list_add_tail( &private_mappings, &mapping->entry );
     mapping->base = mapping->pending_base = 0;
     mapping->offset = mapping->size = mapping->pending_offset = mapping->pending_size = 0;
     mapping->operation = mapping->pending_operation = 0;
+    mapping->pending_vprot = mapping->exit_waiting = mapping->retired = 0;
     mapping->generation = 1;
+    mapping->id = ++private_mapping_serial;
+    if (!(mapping->pages = calloc( req->size >> 12, 1 )) ||
+        !(mapping->ready = create_event( NULL, NULL, 0, 1, 1, NULL )))
+    {
+        set_error( STATUS_NO_MEMORY );
+        release_object( mapping );
+        return;
+    }
     if ((mapping->mapping = create_mapping( NULL, &name, 0, req->size, SEC_COMMIT, 0, 0, NULL )))
     {
         mapping->owner = (struct process *)grab_object( current->process );
@@ -1415,14 +1606,10 @@ DECL_HANDLER(create_private_mapping)
     release_object( mapping );
 }
 
-/* No consumer may observe a backing during a VM mutation. There are no
- * admitted consumers yet; the fence is groundwork for a revoke/ack protocol,
- * not an implementation of that protocol. Both completion and abort advance
- * the epoch so a token is never reused. */
 DECL_HANDLER(begin_private_mapping_change)
 {
     struct private_mapping *mapping;
-
+    struct private_mapping_lease *lease;
     if (!(mapping = get_private_mapping_obj( req->handle ))) return;
     if (mapping->pending_operation) set_error( STATUS_DEVICE_BUSY );
     else if (mapping->generation != req->generation) set_error( STATUS_INVALID_PARAMETER );
@@ -1431,17 +1618,29 @@ DECL_HANDLER(begin_private_mapping_change)
              || req->base + mapping->mapping->size < req->base
              || req->offset >= mapping->mapping->size || req->size > mapping->mapping->size - req->offset
              || req->operation < PRIVATE_MAPPING_PUBLISH || req->operation > PRIVATE_MAPPING_RESET
+             || req->vprot > 255
              || (req->operation == PRIVATE_MAPPING_PUBLISH
                  ? mapping->base || !req->base || req->offset || req->size != mapping->mapping->size
                  : !mapping->base || req->base != mapping->base))
         set_error( STATUS_INVALID_PARAMETER );
     else
     {
+        /* Allocate the wait handle before changing the generation or queueing
+         * revocations. An allocation failure leaves the original state intact. */
+        if (!list_empty( &mapping->leases ) &&
+            !(reply->ready = alloc_handle( current->process, mapping->ready, SYNCHRONIZE, 0 )))
+        {
+            release_object( mapping );
+            return;
+        }
         mapping->pending_base = req->base;
         mapping->pending_offset = req->offset;
         mapping->pending_size = req->size;
         mapping->pending_operation = req->operation;
+        mapping->pending_vprot = req->vprot;
         reply->generation = ++mapping->generation;
+        LIST_FOR_EACH_ENTRY( lease, &mapping->leases, struct private_mapping_lease, entry )
+            revoke_private_lease( lease );
     }
     release_object( mapping );
 }
@@ -1449,14 +1648,31 @@ DECL_HANDLER(begin_private_mapping_change)
 DECL_HANDLER(finish_private_mapping_change)
 {
     struct private_mapping *mapping;
-
     if (!(mapping = get_private_mapping_obj( req->handle ))) return;
     if (!mapping->pending_operation || mapping->generation != req->generation)
         set_error( STATUS_INVALID_PARAMETER );
+    else if (req->commit && !list_empty( &mapping->leases )) set_error( STATUS_DEVICE_BUSY );
     else
     {
         if (req->commit)
         {
+            unsigned int first = mapping->pending_offset >> 12, count = mapping->pending_size >> 12;
+            switch (mapping->pending_operation)
+            {
+            case PRIVATE_MAPPING_PUBLISH:
+            case PRIVATE_MAPPING_COMMIT:
+            case PRIVATE_MAPPING_PROTECT:
+                memset( mapping->pages + first, mapping->pending_vprot, count );
+                break;
+            case PRIVATE_MAPPING_DECOMMIT: memset( mapping->pages + first, 0, count ); break;
+            case PRIVATE_MAPPING_RELEASE: memset( mapping->pages + first, 0x80, count ); break;
+            }
+            if (mapping->pending_operation == PRIVATE_MAPPING_RELEASE)
+            {
+                unsigned int i;
+                for (i = 0; i < mapping->mapping->size >> 12; ++i) if (mapping->pages[i] != 0x80) break;
+                if (i == mapping->mapping->size >> 12) mapping->retired = 1;
+            }
             mapping->base = mapping->pending_base;
             mapping->offset = mapping->pending_offset;
             mapping->size = mapping->pending_size;
@@ -1471,7 +1687,6 @@ DECL_HANDLER(finish_private_mapping_change)
 DECL_HANDLER(query_private_mapping)
 {
     struct private_mapping *mapping;
-
     if (!(mapping = get_private_mapping_obj( req->handle ))) return;
     reply->base = mapping->base;
     reply->size = mapping->mapping->size;
@@ -1483,11 +1698,30 @@ DECL_HANDLER(query_private_mapping)
     release_object( mapping );
 }
 
+DECL_HANDLER(lookup_private_mapping)
+{
+    struct private_mapping *mapping;
+    LIST_FOR_EACH_ENTRY( mapping, &private_mappings, struct private_mapping, entry )
+    {
+        if (mapping->retired || (mapping->pages[0] & 0x80) || mapping->owner != current->process || req->address != mapping->base) continue;
+        reply->handle = alloc_handle_no_access_check( current->process, &mapping->obj, 0, 0 );
+        reply->base = mapping->base;
+        reply->size = mapping->mapping->size;
+        reply->generation = mapping->generation;
+        reply->mapping_id = mapping->id;
+        set_reply_data( mapping->pages, min( mapping->mapping->size >> 12, get_reply_max_size() ));
+        return;
+    }
+    set_error( STATUS_NOT_FOUND );
+}
+
 DECL_HANDLER(acquire_private_mapping)
 {
     struct process *process;
-    unsigned int access = PROCESS_VM_READ;
-
+    struct private_mapping *mapping;
+    struct private_mapping_lease *lease;
+    unsigned int i, access = PROCESS_VM_READ;
+    int pidfd = -1;
     if (req->access & ~(FILE_READ_DATA | FILE_WRITE_DATA) || !(req->access & FILE_READ_DATA)
         || !req->size || req->address + req->size < req->address)
     {
@@ -1496,10 +1730,146 @@ DECL_HANDLER(acquire_private_mapping)
     }
     if (req->access & FILE_WRITE_DATA) access |= PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
     if (!(process = get_process_from_handle( req->process, access ))) return;
-    /* An fd, even read-only, would permit stale access after protect/decommit
-     * or process exit. No fd or mapping capability is returned. */
-    set_error( STATUS_NOT_SUPPORTED );
+    if (current->process->managed_role != 2 || process->managed_role != 1 ||
+        current->process->machine != IMAGE_FILE_MACHINE_AMD64 || process->machine != IMAGE_FILE_MACHINE_AMD64)
+        set_error( STATUS_NOT_SUPPORTED );
+    else if (!process->running_threads || process->is_terminating) set_error( STATUS_PROCESS_IS_TERMINATING );
+    else
+    {
+        LIST_FOR_EACH_ENTRY( mapping, &private_mappings, struct private_mapping, entry )
+            if (!mapping->retired && !(mapping->pages[0] & 0x80) && mapping->owner == process &&
+                mapping->base == req->address) break;
+        if (&mapping->entry == &private_mappings) set_error( STATUS_NOT_FOUND );
+        else if (mapping->pending_operation || !list_empty( &mapping->leases )) set_error( STATUS_DEVICE_BUSY );
+        else if (mapping->mapping->size != req->size) set_error( STATUS_NOT_SUPPORTED );
+        else
+        {
+            /* Initial contract admits only complete committed readable NX
+             * private allocations, excluding guard, COW, writewatch and holes. */
+            for (i = 0; i < req->size >> 12; ++i)
+                if ((mapping->pages[i] & 0x21) != 0x21 || (mapping->pages[i] & 0xdc) ||
+                    ((req->access & FILE_WRITE_DATA) && !(mapping->pages[i] & 2))) break;
+            if (i != req->size >> 12) set_error( STATUS_NOT_SUPPORTED );
+#ifdef __linux__
+#ifdef SYS_pidfd_open
+            else if ((pidfd = syscall( SYS_pidfd_open, current->process->unix_pid, 0 )) == -1)
+                set_error( STATUS_NOT_SUPPORTED );
+#endif
+#endif
+            else if (pidfd == -1) set_error( STATUS_NOT_SUPPORTED );
+            else if (private_lease_serial == ~(unsigned __int64)0) set_error( STATUS_INTEGER_OVERFLOW );
+            else if ((lease = alloc_object( &private_lease_ops )))
+            {
+                lease->mapping = (struct private_mapping *)grab_object( mapping );
+                lease->consumer = (struct process *)grab_object( current->process );
+                lease->handle = 0;
+                lease->ready = NULL;
+                lease->death_timer = NULL;
+                lease->pidfd = pidfd;
+                pidfd = -1;
+                lease->apc_count = 0;
+                lease->state = PRIVATE_MAPPING_LEASE_REVOKED;
+                lease->status = STATUS_PENDING;
+                lease->token = ++private_lease_serial;
+                lease->generation = mapping->generation;
+                lease->access = req->access;
+                if ((lease->ready = create_event( NULL, NULL, 0, 1, 0, NULL )) &&
+                    (lease->handle = alloc_handle_no_access_check( current->process, &lease->obj, 0, 0 )) &&
+                    (reply->ready = alloc_handle( current->process, lease->ready, SYNCHRONIZE, 0 )))
+                {
+                    reset_event( mapping->ready );
+                    lease->state = PRIVATE_MAPPING_LEASE_PENDING;
+                    list_add_tail( &mapping->leases, &lease->entry );
+                    grab_object( lease );
+                    if (queue_private_lease_apc( lease, 0 ))
+                    {
+                        reply->handle = lease->handle;
+                        reply->token = lease->token;
+                        reply->generation = lease->generation;
+                        reply->mapping_id = mapping->id;
+                    }
+                    else
+                    {
+                        private_lease_revoked( lease );
+                        close_handle( current->process, lease->handle );
+                        close_handle( current->process, reply->ready );
+                        reply->ready = 0;
+                        set_error( STATUS_PROCESS_IS_TERMINATING );
+                    }
+                }
+                else if (lease->handle) close_handle( current->process, lease->handle );
+                release_object( lease );
+            }
+        }
+    }
+    if (pidfd != -1) close( pidfd );
     release_object( process );
+}
+
+DECL_HANDLER(query_private_mapping_lease)
+{
+    struct private_mapping_lease *lease;
+    if (!(lease = get_private_lease( req->handle, req->token, req->generation ))) return;
+    reply->state = lease->state;
+    reply->status = lease->status;
+    reply->access = lease->access;
+    reply->base = lease->mapping->base;
+    reply->size = lease->mapping->mapping->size;
+    if (lease->state == PRIVATE_MAPPING_LEASE_PENDING)
+        set_reply_data( lease->mapping->pages, min( reply->size >> 12, get_reply_max_size() ));
+    release_object( lease );
+}
+
+DECL_HANDLER(get_private_mapping_fd)
+{
+    struct private_mapping_lease *lease;
+    struct fd *fd;
+    if (!(lease = get_private_lease( req->handle, req->token, req->generation ))) return;
+    if (lease->state != PRIVATE_MAPPING_LEASE_PENDING) set_error( STATUS_DEVICE_BUSY );
+    else if ((fd = get_obj_fd( &lease->mapping->mapping->obj )))
+    {
+        int unix_fd = get_unix_fd( fd );
+        if (unix_fd != -1) send_client_fd( current->process, unix_fd, req->handle );
+        release_object( fd );
+    }
+    release_object( lease );
+}
+
+DECL_HANDLER(confirm_private_mapping_lease)
+{
+    struct private_mapping_lease *lease;
+    if (!(lease = get_private_lease( req->handle, req->token, req->generation ))) return;
+    if (lease->state != PRIVATE_MAPPING_LEASE_PENDING) set_error( STATUS_CANCELLED );
+    else
+    {
+        lease->status = req->status;
+        if (req->status) private_lease_revoked( lease );
+        else
+        {
+            lease->state = PRIVATE_MAPPING_LEASE_LIVE;
+            set_event( lease->ready );
+        }
+    }
+    release_object( lease );
+}
+
+DECL_HANDLER(release_private_mapping_lease)
+{
+    struct private_mapping_lease *lease;
+    if (!(lease = get_private_lease( req->handle, req->token, req->generation ))) return;
+    if ((reply->ready = alloc_handle( current->process, lease->ready, SYNCHRONIZE, 0 )))
+        revoke_private_lease( lease );
+    release_object( lease );
+}
+
+DECL_HANDLER(ack_private_mapping_revoke)
+{
+    struct private_mapping_lease *lease;
+    if (!(lease = get_private_lease( req->handle, req->token, req->generation ))) return;
+    if (lease->state != PRIVATE_MAPPING_LEASE_REVOKING && lease->state != PRIVATE_MAPPING_LEASE_REVOKED)
+        set_error( STATUS_INVALID_PARAMETER );
+    else private_lease_revoked( lease );
+    release_object( lease );
 }
 
 /* assign a mapping address to a PE image mapping */

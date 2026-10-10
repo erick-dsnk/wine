@@ -718,6 +718,8 @@ static void thread_apc_destroy( struct object *obj )
             async_set_result( apc->owner, apc->result.async_io.status, apc->result.async_io.total );
         else if (apc->call.type == APC_ASYNC_IO)
             async_set_result( apc->owner, apc->call.async_io.status, 0 );
+        else if (apc->call.type == APC_PRIVATE_MAPPING && !apc->executed)
+            private_mapping_apc_finished( apc->owner, 1 );
         release_object( apc->owner );
     }
     if (apc->sync) release_object( apc->sync );
@@ -1540,6 +1542,7 @@ void thread_cancel_apc( struct thread *thread, struct object *owner, enum apc_ty
     {
         if (apc->owner != owner) continue;
         list_remove( &apc->entry );
+        if (apc->call.type == APC_PRIVATE_MAPPING) private_mapping_apc_finished( apc->owner, 1 );
         apc->executed = 1;
         signal_sync( apc->sync );
         release_object( apc );
@@ -1574,6 +1577,7 @@ static void clear_apc_queue( struct list *queue )
     {
         struct thread_apc *apc = LIST_ENTRY( ptr, struct thread_apc, entry );
         list_remove( &apc->entry );
+        if (apc->call.type == APC_PRIVATE_MAPPING) private_mapping_apc_finished( apc->owner, 1 );
         apc->executed = 1;
         signal_sync( apc->sync );
         release_object( apc );
@@ -2084,6 +2088,7 @@ DECL_HANDLER(select)
         if (!(apc = (struct thread_apc *)get_handle_obj( current->process, req->prev_apc,
                                                          0, &thread_apc_ops ))) return;
         apc->result = *result;
+        if (apc->call.type == APC_PRIVATE_MAPPING) private_mapping_apc_finished( apc->owner, 0 );
         apc->executed = 1;
         if (apc->result.type == APC_CREATE_THREAD)  /* transfer the handle to the caller process */
         {
@@ -2115,6 +2120,7 @@ DECL_HANDLER(select)
         }
         else
         {
+            if (apc->call.type == APC_PRIVATE_MAPPING) private_mapping_apc_finished( apc->owner, 1 );
             apc->executed = 1;
             signal_sync( apc->sync );
         }

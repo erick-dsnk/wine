@@ -3056,6 +3056,196 @@ release_whole:
     ok(status == STATUS_SUCCESS, "fallback reservation release returned %08lx\n", status);
 }
 
+/* These probes execute ordinary loads/stores.  The handler only recovers the
+ * exact instruction and address under test; an unrelated fault is not hidden. */
+#ifdef __x86_64__
+static void *private_probe_pc, *private_probe_resume, *private_probe_address;
+static ULONG_PTR private_probe_access;
+static unsigned int private_probe_faults;
+
+static LONG CALLBACK private_backing_probe_handler( EXCEPTION_POINTERS *exception )
+{
+    EXCEPTION_RECORD *record = exception->ExceptionRecord;
+
+    if (record->ExceptionCode != STATUS_ACCESS_VIOLATION || record->NumberParameters != 2 ||
+        record->ExceptionAddress != private_probe_pc ||
+        record->ExceptionInformation[1] != (ULONG_PTR)private_probe_address)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    private_probe_access = record->ExceptionInformation[0];
+    ++private_probe_faults;
+    exception->ContextRecord->Rip = (ULONG_PTR)private_probe_resume;
+    exception->ContextRecord->Rax = 0xdead;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void private_backing_expect_access( void *function, void *address, ULONG_PTR access,
+                                          BOOL fault, unsigned int expected, void *resume )
+{
+    unsigned int (__cdecl *probe)( void *, unsigned int ) = function;
+    unsigned int result;
+
+    private_probe_pc = function;
+    private_probe_resume = resume;
+    private_probe_address = address;
+    private_probe_access = ~0;
+    private_probe_faults = 0;
+    result = probe( address, 0x63 );
+    private_probe_pc = NULL;
+    ok( private_probe_faults == !!fault, "access %Iu faults %u expected %u at %p\n",
+        access, private_probe_faults, !!fault, address );
+    if (fault)
+    {
+        ok( private_probe_access == access, "fault access %Iu expected %Iu\n", private_probe_access, access );
+        ok( result == 0xdead, "fault probe result %#x\n", result );
+    }
+    else ok( result == expected, "access %Iu result %#x expected %#x\n", access, result, expected );
+}
+#endif
+
+static void test_private_mapping_protection_lifetime(void)
+{
+#ifdef __x86_64__
+    static const BYTE read_code[] = { 0x0f, 0xb6, 0x01, 0xc3 }; /* movzbl (rcx),eax; ret */
+    static const BYTE write_code[] = { 0x88, 0x11, 0x31, 0xc0, 0xc3 }; /* mov dl,(rcx); xor eax,eax; ret */
+    static const BYTE exec_code[] = { 0xb8, 42, 0, 0, 0, 0xc3 }; /* mov eax,42; ret */
+    BYTE *code, *base = NULL, *saved, *addr;
+    MEMORY_BASIC_INFORMATION mbi;
+    SIZE_T size, query_size, i;
+    NTSTATUS status;
+    HANDLE handler = NULL;
+    ULONG old_protect;
+
+    /* Run the same observable VM contract with backing on and off. */
+    code = VirtualAlloc( NULL, page_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE );
+    ok( code != NULL, "probe allocation failed: %lu\n", GetLastError() );
+    if (!code) return;
+    memcpy( code, read_code, sizeof(read_code) );
+    memcpy( code + 16, write_code, sizeof(write_code) );
+    code[32] = 0xc3; /* Recovery returns through the probe's existing caller frame. */
+    ok( FlushInstructionCache( GetCurrentProcess(), code, page_size ), "probe cache flush failed\n" );
+    if (!VirtualProtect( code, page_size, PAGE_EXECUTE_READ, &old_protect ))
+    {
+        ok( 0, "probe protection failed: %lu\n", GetLastError() );
+        goto done;
+    }
+    handler = RtlAddVectoredExceptionHandler( TRUE, private_backing_probe_handler );
+    ok( handler != NULL, "probe handler installation failed\n" );
+    if (!handler) goto done;
+    size = page_size * 3;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&base, 0, &size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( status == STATUS_SUCCESS, "lifetime allocation returned %08lx\n", status );
+    if (status) goto done;
+    saved = base;
+    for (i = 0; i < page_size * 3 && !base[i]; ++i) {}
+    ok( i == page_size * 3, "first commit retained data at offset %Ix\n", i );
+    memset( base, 0x5a, page_size * 3 );
+
+    private_backing_expect_access( code, base, 0, FALSE, 0x5a, code + 32 );
+    private_backing_expect_access( code + 16, base, 1, FALSE, 0, code + 32 );
+    ok( base[0] == 0x63, "ordinary write was not visible\n" );
+    memcpy( base, exec_code, sizeof(exec_code) );
+    private_backing_expect_access( base, base, 8, TRUE, 0, code + 32 );
+    addr = base;
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), (void **)&addr, &size, PAGE_EXECUTE_READ, &old_protect );
+    ok( status == STATUS_SUCCESS, "execute protection returned %08lx\n", status );
+    if (status) goto release;
+    ok( old_protect == PAGE_READWRITE, "old executable page protection %#lx\n", old_protect );
+    ok( FlushInstructionCache( GetCurrentProcess(), base, sizeof(exec_code) ), "target cache flush failed\n" );
+    private_backing_expect_access( base, base, 8, FALSE, 42, code + 32 );
+    private_backing_expect_access( code + 16, base, 1, TRUE, 0, code + 32 );
+    addr = base;
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), (void **)&addr, &size, PAGE_READWRITE, &old_protect );
+    ok( status == STATUS_SUCCESS, "remove execute protection returned %08lx\n", status );
+    if (status) goto release;
+    ok( old_protect == PAGE_EXECUTE_READ, "removed executable page old protection %#lx\n", old_protect );
+    private_backing_expect_access( base, base, 8, TRUE, 0, code + 32 );
+    private_backing_expect_access( code + 16, base, 1, FALSE, 0, code + 32 );
+    private_backing_expect_access( code, base, 0, FALSE, 0x63, code + 32 );
+
+    addr = base + page_size;
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), (void **)&addr, &size, PAGE_READONLY, &old_protect );
+    ok( status == STATUS_SUCCESS, "read-only protection returned %08lx\n", status );
+    if (status) goto release;
+    private_backing_expect_access( code, addr, 0, FALSE, 0x5a, code + 32 );
+    private_backing_expect_access( code + 16, addr, 1, TRUE, 0, code + 32 );
+    ok( base[page_size] == 0x5a && base[page_size * 2] == 0x5a, "read-only fault changed bytes\n" );
+
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), (void **)&addr, &size, PAGE_NOACCESS, &old_protect );
+    ok( status == STATUS_SUCCESS, "no-access protection returned %08lx\n", status );
+    if (status) goto release;
+    private_backing_expect_access( code, addr, 0, TRUE, 0, code + 32 );
+    private_backing_expect_access( code + 16, addr, 1, TRUE, 0, code + 32 );
+    size = page_size;
+    status = NtFreeVirtualMemory( NtCurrentProcess(), (void **)&addr, &size, MEM_DECOMMIT );
+    ok( status == STATUS_SUCCESS, "lifetime decommit returned %08lx\n", status );
+    if (status) goto release;
+    private_backing_expect_access( code, addr, 0, TRUE, 0, code + 32 );
+    private_backing_expect_access( code + 16, addr, 1, TRUE, 0, code + 32 );
+    size = page_size;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&addr, 0, &size, MEM_COMMIT, PAGE_READWRITE );
+    ok( status == STATUS_SUCCESS, "lifetime recommit returned %08lx\n", status );
+    if (status) goto release;
+    for (i = 0; i < page_size && !addr[i]; ++i) {}
+    ok( i == page_size, "recommitted page retained data at offset %Ix\n", i );
+    private_backing_expect_access( code + 16, addr, 1, FALSE, 0, code + 32 );
+    private_backing_expect_access( code, addr, 0, FALSE, 0x63, code + 32 );
+    ok( base[page_size * 2] == 0x5a, "neighbor changed across protection/decommit/recommit\n" );
+    addr = base + page_size * 2;
+    size = page_size;
+    status = NtFreeVirtualMemory( NtCurrentProcess(), (void **)&addr, &size, MEM_DECOMMIT );
+    ok( status == STATUS_SUCCESS, "read/write page decommit returned %08lx\n", status );
+    if (status) goto release;
+    private_backing_expect_access( code, addr, 0, TRUE, 0, code + 32 );
+    private_backing_expect_access( code + 16, addr, 1, TRUE, 0, code + 32 );
+    ok( base[0] == 0x63 && base[page_size] == 0x63, "read/write decommit changed neighbors\n" );
+
+release:
+    size = 0;
+    status = NtFreeVirtualMemory( NtCurrentProcess(), (void **)&base, &size, MEM_RELEASE );
+    ok( status == STATUS_SUCCESS, "lifetime release returned %08lx\n", status );
+    if (status) goto done;
+    base = NULL;
+    private_backing_expect_access( code, saved, 0, TRUE, 0, code + 32 );
+    private_backing_expect_access( code + 16, saved, 1, TRUE, 0, code + 32 );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), saved, MemoryBasicInformation,
+                                  &mbi, sizeof(mbi), &query_size );
+    ok( status == STATUS_SUCCESS, "released lifetime query returned %08lx\n", status );
+    if (!status) ok( mbi.State == MEM_FREE, "released lifetime state %#lx\n", mbi.State );
+    base = saved;
+    size = page_size * 3;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&base, 0, &size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( status == STATUS_SUCCESS, "same-address reuse returned %08lx\n", status );
+    if (status)
+    {
+        base = NULL;
+        goto done;
+    }
+    ok( base == saved, "reuse base %p expected %p\n", base, saved );
+    for (i = 0; i < page_size * 3 && !base[i]; ++i) {}
+    ok( i == page_size * 3, "reused mapping retained old data at offset %Ix\n", i );
+    private_backing_expect_access( code + 16, base, 1, FALSE, 0, code + 32 );
+    private_backing_expect_access( code, base, 0, FALSE, 0x63, code + 32 );
+    trace( "private_backing_matrix protection_lifetime completed backing=%u\n", shared_private_backing_enabled() );
+
+done:
+    if (base)
+    {
+        size = 0;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), (void **)&base, &size, MEM_RELEASE );
+        ok( status == STATUS_SUCCESS, "reuse cleanup returned %08lx\n", status );
+    }
+    if (handler) RtlRemoveVectoredExceptionHandler( handler );
+    VirtualFree( code, 0, MEM_RELEASE );
+#endif
+}
+
 static void test_shared_private_backing_child(void)
 {
     HANDLE process = NULL, ready_event = NULL, release_event = NULL;
@@ -3071,7 +3261,8 @@ static void test_shared_private_backing_child(void)
     BOOL common_found = FALSE;
     HANDLE wait_handles[2];
 
-    if (!shared_private_backing_enabled()) return;
+    /* The explicit observer hold also exercises this fixture with backing off. */
+    if (!shared_private_backing_enabled() && !shared_private_backing_probe_hold()) return;
 
     sprintf(ready_name, "wine_shared_private_backing_%08lx_ready", GetCurrentProcessId());
     sprintf(release_name, "wine_shared_private_backing_%08lx_release", GetCurrentProcessId());
@@ -3182,8 +3373,15 @@ static void test_shared_private_backing_child(void)
         got_exit_code = GetExitCodeProcess(process, &exit_code);
         ok(got_exit_code, "GetExitCodeProcess failed: %lu\n", GetLastError());
         ok(exit_code == 0, "child exited with %lu\n", exit_code);
+        ok(*(volatile BYTE *)base == 0x59, "child exit changed caller's private bytes\n");
+        *(volatile BYTE *)base = 0x5b;
+        ok(*(volatile BYTE *)base == 0x5b, "caller mapping became unusable after child exit\n");
         trace("shared_private_backing_probe state=free owner=child parent_state=resident parent_pid=%lu child_pid=%lu base=%p size=%Ix exit=%lu\n",
               GetCurrentProcessId(), GetProcessId(process), remote_base, remote_size, exit_code);
+        {
+            DWORD hold = shared_private_backing_probe_hold();
+            if (hold) Sleep(hold);
+        }
     }
     else
     {
@@ -4576,6 +4774,7 @@ START_TEST(virtual)
     test_NtAllocateVirtualMemoryEx_address_requirements();
     test_NtFreeVirtualMemory();
     test_shared_private_backing_lifecycle();
+    test_private_mapping_protection_lifetime();
     test_shared_private_backing_child();
     test_shared_private_backing_failure();
     test_NtProtectVirtualMemory();

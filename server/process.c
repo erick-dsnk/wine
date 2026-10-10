@@ -206,6 +206,7 @@ struct job
     struct object       *sync;              /* sync object for wait/signal */
     struct list          process_list;      /* list of processes */
     int                  num_processes;     /* count of running processes */
+    int                  private_exit_waiting; /* defer termination wait signal for leased owners */
     int                  total_processes;   /* count of processes which have been assigned */
     unsigned int         limit_flags;       /* limit flags */
     int                  terminating;       /* job is terminating */
@@ -255,6 +256,7 @@ static struct job *create_job_object( struct object *root, const struct unicode_
             list_init( &job->process_list );
             list_init( &job->child_job_list );
             job->num_processes = 0;
+            job->private_exit_waiting = 0;
             job->total_processes = 0;
             job->limit_flags = 0;
             job->terminating = 0;
@@ -380,6 +382,17 @@ static void add_job_process( struct job *job, struct process *process )
     }
 }
 
+static int job_has_private_exit( struct job *job )
+{
+    struct process *process;
+    struct job *child;
+    LIST_FOR_EACH_ENTRY( process, &job->process_list, struct process, job_entry )
+        if (process->private_exit_pending) return 1;
+    LIST_FOR_EACH_ENTRY( child, &job->child_job_list, struct job, parent_job_entry )
+        if (job_has_private_exit( child )) return 1;
+    return 0;
+}
+
 /* called when a process has terminated, allow one additional process */
 static void release_job_process( struct process *process )
 {
@@ -395,6 +408,11 @@ static void release_job_process( struct process *process )
 
         if (!job->num_processes)
             add_job_completion( job, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, 0 );
+        if (job->private_exit_waiting && !job_has_private_exit( job ))
+        {
+            job->private_exit_waiting = 0;
+            signal_sync( job->sync );
+        }
 
         job = job->parent;
     }
@@ -421,6 +439,7 @@ static void terminate_job( struct job *job, int exit_code )
         if (process->running_threads) terminate_process( process, NULL, exit_code );
     }
     job->terminating = 0;
+    if ((job->private_exit_waiting = job_has_private_exit( job ))) return;
     signal_sync( job->sync );
 }
 
@@ -679,6 +698,9 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->unix_pid        = -1;
     process->exit_code       = STILL_ACTIVE;
     process->running_threads = 0;
+    process->managed_role = 0;
+    process->private_exit_pending = 0;
+    process->private_exit_thread = NULL;
     process->priority        = PROCESS_PRIOCLASS_NORMAL;
     process->base_priority   = 8;
     process->disable_boost   = 0;
@@ -976,11 +998,12 @@ restart:
 /* kill all processes */
 static void kill_all_processes(void)
 {
-    struct list *ptr;
-
-    while ((ptr = list_head( &process_list )))
+    struct process *process;
+    for (;;)
     {
-        struct process *process = LIST_ENTRY( ptr, struct process, entry );
+        LIST_FOR_EACH_ENTRY( process, &process_list, struct process, entry )
+            if (process->running_threads) break;
+        if (&process->entry == &process_list) break;
         terminate_process( process, NULL, 1 );
     }
 }
@@ -1007,7 +1030,7 @@ void kill_console_processes( struct thread *renderer, int exit_code )
 static void process_killed( struct process *process )
 {
     assert( list_empty( &process->thread_list ));
-    process->end_time = current_time;
+    if (!process->private_exit_pending) process->end_time = current_time;
     close_process_desktop( process );
     process->winstation = 0;
     process->desktop = 0;
@@ -1023,9 +1046,24 @@ static void process_killed( struct process *process )
     remove_process_locks( process );
     set_process_startup_state( process, STARTUP_ABORTED );
     finish_process_tracing( process );
-    release_job_process( process );
+    if (!process->private_exit_pending) release_job_process( process );
     start_sigkill_timer( process );
+    if (!process->private_exit_pending) signal_sync( process->sync );
+}
+
+/* Complete externally observable owner exit only after all foreign views have
+ * been removed or their consumer Unix address spaces are confirmed dead. */
+void complete_private_mapping_process_exit( struct process *process )
+{
+    struct thread *thread = process->private_exit_thread;
+    assert( !process->private_exit_pending && thread );
+    process->private_exit_thread = NULL;
+    list_remove( &process->entry );
+    process->end_time = current_time;
+    generate_debug_event( thread, DbgExitProcessStateChange, process );
+    release_job_process( process );
     signal_sync( process->sync );
+    release_object( thread );
 }
 
 /* add a thread to a process running threads list */
@@ -1060,8 +1098,10 @@ void remove_process_thread( struct process *process, struct thread *thread )
     {
         /* we have removed the last running thread, exit the process */
         process->exit_code = thread->exit_code;
-        generate_debug_event( thread, DbgExitProcessStateChange, process );
-        list_remove( &process->entry );
+        if (revoke_process_private_mappings( process ))
+            process->private_exit_thread = (struct thread *)grab_object( thread );
+        else generate_debug_event( thread, DbgExitProcessStateChange, process );
+        if (!process->private_exit_pending) list_remove( &process->entry );
         process_killed( process );
     }
     else generate_debug_event( thread, DbgExitThreadStateChange, thread );
@@ -1424,7 +1464,7 @@ DECL_HANDLER(get_new_process_info)
                                                        0, &startup_info_ops )))
     {
         reply->success = is_process_init_done( info->process );
-        reply->exit_code = info->process->exit_code;
+        reply->exit_code = info->process->private_exit_pending ? STILL_ACTIVE : info->process->exit_code;
         release_object( info );
     }
 }
@@ -1495,6 +1535,7 @@ DECL_HANDLER(init_process_done)
 
     current->teb = req->teb;
     process->peb = req->peb;
+    process->managed_role = req->managed_role;
 
     process->start_time = current_time;
 
@@ -1546,7 +1587,7 @@ DECL_HANDLER(get_process_info)
     {
         reply->pid              = get_process_id( process );
         reply->ppid             = process->parent_id;
-        reply->exit_code        = process->exit_code;
+        reply->exit_code        = process->private_exit_pending ? STILL_ACTIVE : process->exit_code;
         reply->priority         = process->priority;
         reply->base_priority    = process->base_priority;
         reply->disable_boost    = process->disable_boost;
@@ -1558,7 +1599,7 @@ DECL_HANDLER(get_process_info)
         reply->machine          = process->machine;
         if (get_reply_max_size())
         {
-            if (!process->running_threads) set_error( STATUS_PROCESS_IS_TERMINATING );
+            if (!process->running_threads && !process->private_exit_pending) set_error( STATUS_PROCESS_IS_TERMINATING );
             else set_reply_data( &process->image_info, min( sizeof(process->image_info), get_reply_max_size() ));
         }
         release_object( process );

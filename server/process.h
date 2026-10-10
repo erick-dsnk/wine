@@ -49,6 +49,9 @@ struct process
     unsigned int         session_id;      /* session id */
     struct timeout_user *sigkill_timeout; /* timeout for final SIGKILL */
     timeout_t            sigkill_delay;   /* delay before final SIGKILL */
+    unsigned int         managed_role;    /* validated experimental startup role */
+    struct thread       *private_exit_thread; /* retained final thread until owner leases revoke */
+    unsigned int         private_exit_pending; /* owner mappings awaiting revoke acknowledgements */
     unsigned short       machine;         /* client machine type */
     int                  unix_pid;        /* Unix pid for final SIGKILL */
     int                  exit_code;       /* process exit code */
@@ -116,6 +119,9 @@ extern void remove_process_thread( struct process *process,
                                    struct thread *thread );
 extern void suspend_process( struct process *process );
 extern void resume_process( struct process *process );
+extern int revoke_process_private_mappings( struct process *process );
+extern void private_mapping_apc_finished( struct object *obj, int cancelled );
+extern void complete_private_mapping_process_exit( struct process *process );
 extern void kill_process( struct process *process, int violent_death );
 extern void kill_console_processes( struct thread *renderer, int exit_code );
 extern void detach_debugged_processes( struct debug_obj *debug_obj, int exit_code );

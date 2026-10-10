@@ -18,7 +18,8 @@
 #define WINE_MANAGED_EXECUTOR_SETTING "v2:executor:400000000000:410000000000"
 #define WINE_MANAGED_EXECUTOR_VERSION 2
 #define WINE_MANAGED_LAYOUT_EXECUTOR  2
-#define WINE_MANAGED_EXECUTOR_LAYOUT_ID 2
+#define WINE_MANAGED_EXECUTOR_LAYOUT_ID 3
+#define WINE_MANAGED_EXECUTOR_RESERVATION_FILE_BACKED_SEALED 1u
 #define WINE_MANAGED_HOST_START     0x400000000000ULL
 #define WINE_MANAGED_HOST_END       0x410000000000ULL
 #define WINE_MANAGED_HOST_NTDLL_START WINE_MANAGED_HOST_START
@@ -39,7 +40,8 @@ struct wine_managed_layout
 };
 
 /* Version 1 remains exactly the common prefix above. Read this extension only
- * after validating version 2 and the executor role of the preloader handoff. */
+ * after validating version 2 and the executor role. Layout 3 carries the
+ * sealed file-backed guest reservation used to restore revocable views. */
 struct wine_managed_executor_layout
 {
     struct wine_managed_layout common;
@@ -53,6 +55,8 @@ struct wine_managed_executor_layout
     unsigned long long shared_data_end;
     unsigned long long dispatcher_start;
     unsigned long long dispatcher_end;
+    int guest_reservation_fd;
+    unsigned int guest_reservation_flags;
 };
 
 #endif

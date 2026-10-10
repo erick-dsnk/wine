@@ -445,6 +445,10 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
         else result->async_io.status = STATUS_PENDING; /* restart it */
         break;
     }
+    case APC_PRIVATE_MAPPING:
+        virtual_private_mapping_apc( call );
+        result->type = call->type;
+        break;
     case APC_VIRTUAL_ALLOC:
         result->type = call->type;
         addr = wine_server_get_ptr( call->virtual_alloc.addr );
@@ -1799,6 +1803,7 @@ void server_init_process_done(void)
     /* Signal the parent process to continue */
     SERVER_START_REQ( init_process_done )
     {
+        req->managed_role = virtual_is_managed_target() ? 1 : virtual_is_managed_executor() ? 2 : 0;
         req->teb = wine_server_client_ptr( teb );
         req->peb = NtCurrentTeb64() ? NtCurrentTeb64()->Peb : wine_server_client_ptr( peb );
         status = wine_server_call( req );

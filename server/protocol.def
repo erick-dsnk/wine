@@ -502,7 +502,8 @@ enum apc_type
     APC_MAP_VIEW_EX,
     APC_UNMAP_VIEW,
     APC_CREATE_THREAD,
-    APC_DUP_HANDLE
+    APC_DUP_HANDLE,
+    APC_PRIVATE_MAPPING
 };
 
 struct user_apc
@@ -640,6 +641,14 @@ union apc_call
         unsigned int     attributes;   /* object attributes */
         unsigned int     options;      /* duplicate options */
     } dup_handle;
+    struct
+    {
+        enum apc_type type;
+        obj_handle_t handle;
+        unsigned __int64 token;
+        unsigned __int64 generation;
+        unsigned int revoke;
+    } private_mapping;
 };
 
 union apc_result
@@ -1156,6 +1165,7 @@ struct cpu_topology_override
     client_ptr_t teb;          /* TEB of new thread (in process address space) */
     client_ptr_t peb;          /* PEB of new process (in process address space) */
     client_ptr_t ldt_copy;     /* address of LDT copy (in process address space) */
+    unsigned int managed_role; /* validated preloader role: 0 / TARGET=1 / EXECUTOR=2 */
 @REPLY
     int          suspend;      /* is process suspended? */
 @END
@@ -4382,8 +4392,10 @@ enum private_mapping_operation
     mem_size_t size;
     unsigned __int64 generation; /* expected current generation */
     unsigned int operation;     /* private_mapping_operation */
+    unsigned int vprot;         /* authoritative per-page flags after successful change */
 @REPLY
     unsigned __int64 generation; /* transaction token; backing is fenced */
+    obj_handle_t ready;          /* wait for all revocation acknowledgements */
 @END
 
 @REQ(finish_private_mapping_change)
@@ -4406,12 +4418,79 @@ enum private_mapping_operation
     int updating;
 @END
 
-/* Deliberately unavailable until mapped aliases can be revoked. Checking a
- * generation before a read cannot make a stale foreign mmap safe. */
+enum private_mapping_lease_state
+{
+    PRIVATE_MAPPING_LEASE_PENDING = 1,
+    PRIVATE_MAPPING_LEASE_LIVE,
+    PRIVATE_MAPPING_LEASE_REVOKING,
+    PRIVATE_MAPPING_LEASE_REVOKED
+};
+
+/* Internal opt-in managed TARGET -> EXECUTOR lease. The server reserves the
+ * lease before queuing the map APC and fences every owner VM mutation. */
 @REQ(acquire_private_mapping)
     obj_handle_t process;
     client_ptr_t address;
     mem_size_t size;
     unsigned int access;
+@REPLY
+    obj_handle_t handle;
+    obj_handle_t ready;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+    unsigned __int64 mapping_id;
+@END
+
+@REQ(lookup_private_mapping)
+    client_ptr_t address;
+@REPLY
+    obj_handle_t handle;
+    client_ptr_t base;
+    mem_size_t size;
+    unsigned __int64 generation;
+    unsigned __int64 mapping_id;
+    VARARG(pages,bytes);
+@END
+
+@REQ(query_private_mapping_lease)
+    obj_handle_t handle;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+@REPLY
+    unsigned int state;
+    unsigned int status;
+    unsigned int access;
+    client_ptr_t base;
+    mem_size_t size;
+    VARARG(pages,bytes);
+@END
+
+@REQ(confirm_private_mapping_lease)
+    obj_handle_t handle;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+    unsigned int status;
+@REPLY
+@END
+
+@REQ(release_private_mapping_lease)
+    obj_handle_t handle;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+@REPLY
+    obj_handle_t ready;
+@END
+
+@REQ(ack_private_mapping_revoke)
+    obj_handle_t handle;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+@REPLY
+@END
+
+@REQ(get_private_mapping_fd)
+    obj_handle_t handle;
+    unsigned __int64 token;
+    unsigned __int64 generation;
 @REPLY
 @END

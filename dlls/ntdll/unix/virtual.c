@@ -94,6 +94,9 @@
 
 #include "ntstatus.h"
 #include "wine/managed_layout.h"
+#ifdef __linux__
+# include <sys/sysmacros.h>
+#endif
 #define WIN32_NO_STATUS
 #include "windef.h"
 #include "winnt.h"
@@ -266,7 +269,8 @@ enum managed_view_purpose
     MANAGED_VIEW_ORDINARY,
     MANAGED_VIEW_HOST_NTDLL,
     MANAGED_VIEW_SHARED_DATA,
-    MANAGED_VIEW_SYSCALL_DISPATCH
+    MANAGED_VIEW_SYSCALL_DISPATCH,
+    MANAGED_VIEW_FOREIGN_PRIVATE
 };
 
 struct file_view
@@ -277,6 +281,8 @@ struct file_view
     enum managed_view_purpose purpose; /* internal creation/lifetime contract */
     unsigned int  protect;       /* protection for all pages at allocation time and SEC_* flags */
     struct private_mapping_backing *private_backing; /* optional authoritative MEM_PRIVATE backing */
+    obj_handle_t foreign_handle;
+    ULONGLONG foreign_token, foreign_generation;
 };
 
 /* per-page protection flags */
@@ -351,6 +357,9 @@ static void *host_addr_space_limit;  /* top of the host virtual address space */
 static BOOL managed_target;         /* copied once from the preloader handoff */
 static BOOL managed_executor;
 static struct wine_managed_executor_layout executor_layout;
+static int guest_reservation_fd = -1;
+static dev_t guest_reservation_dev;
+static ino_t guest_reservation_ino;
 
 BOOL virtual_is_managed_target(void)
 {
@@ -1334,7 +1343,8 @@ static inline int is_view_valloc( const struct file_view *view )
 
 static BOOL is_managed_abi_view( const struct file_view *view )
 {
-    return view->purpose == MANAGED_VIEW_SHARED_DATA || view->purpose == MANAGED_VIEW_SYSCALL_DISPATCH;
+    return view->purpose == MANAGED_VIEW_SHARED_DATA || view->purpose == MANAGED_VIEW_SYSCALL_DISPATCH ||
+           view->purpose == MANAGED_VIEW_FOREIGN_PRIVATE;
 }
 
 /***********************************************************************
@@ -1987,12 +1997,14 @@ static void DECLSPEC_NORETURN private_mapping_fatal( const char *stage, NTSTATUS
     abort_process( STATUS_UNSUCCESSFUL );
 }
 
-/* All local operations are serialized by virtual_mutex. There are no foreign
- * consumers: the server never grants an alias capability in this phase. */
+/* Local operations serialize under virtual_mutex. The server fences the
+ * backing and waits for every foreign lease revoke before local mutation. */
 static NTSTATUS begin_private_mapping_change( struct private_mapping_backing *backing, void *base,
-                                              size_t size, unsigned int operation )
+                                              size_t size, unsigned int operation, BYTE vprot )
 {
     NTSTATUS status = STATUS_SUCCESS;
+    HANDLE ready = NULL;
+    LARGE_INTEGER timeout = { .QuadPart = -5 * (LONGLONG)10000000 };
 
     if (!backing) return status;
     SERVER_START_REQ( begin_private_mapping_change )
@@ -2003,9 +2015,34 @@ static NTSTATUS begin_private_mapping_change( struct private_mapping_backing *ba
         req->size = size;
         req->generation = backing->generation;
         req->operation = operation;
-        if (!(status = wine_server_call( req ))) backing->generation = reply->generation;
+        req->vprot = vprot;
+        if (!(status = wine_server_call( req )))
+        {
+            backing->generation = reply->generation;
+            ready = wine_server_ptr_handle( reply->ready );
+        }
     }
     SERVER_END_REQ;
+    if (!status && ready)
+    {
+        status = NtWaitForSingleObject( ready, FALSE, &timeout );
+        NtClose( ready );
+        if (status)
+        {
+            /* Abort before touching the owner mapping. Revoked/revoking
+             * leases remain fenced and can never be granted again. */
+            SERVER_START_REQ( finish_private_mapping_change )
+            {
+                req->handle = wine_server_obj_handle( backing->handle );
+                req->generation = backing->generation;
+                req->commit = 0;
+                if (wine_server_call( req )) private_mapping_fatal( "revocation timeout abort", status, STATUS_UNSUCCESSFUL );
+                backing->generation = reply->generation;
+            }
+            SERVER_END_REQ;
+            if (status == STATUS_TIMEOUT) status = STATUS_IO_TIMEOUT;
+        }
+    }
     return status;
 }
 
@@ -2106,6 +2143,8 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     view->protect = vprot;
     view->purpose = MANAGED_VIEW_ORDINARY;
     view->private_backing = NULL;
+    view->foreign_handle = 0;
+    view->foreign_token = view->foreign_generation = 0;
     if (use_kernel_writewatch) vprot &= ~VPROT_WRITEWATCH;
     set_page_vprot( base, size, vprot );
 
@@ -2266,6 +2305,7 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
     BYTE *previous = NULL;
     size_t i;
 
+    if (view->purpose == MANAGED_VIEW_FOREIGN_PRIVATE) return STATUS_ACCESS_DENIED;
     if ((status = get_vprot_flags( protect, &vprot, view->protect & SEC_IMAGE ))) return status;
     if (is_view_valloc( view ))
     {
@@ -2281,7 +2321,7 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
     {
         if (!(previous = malloc( size / page_size ))) return STATUS_NO_MEMORY;
         for (i = 0; i < size / page_size; ++i) previous[i] = get_page_vprot( (char *)base + i * page_size );
-        status = begin_private_mapping_change( view->private_backing, base, size, operation );
+        status = begin_private_mapping_change( view->private_backing, base, size, operation, vprot | VPROT_COMMITTED );
         if (status)
         {
             free( previous );
@@ -2371,7 +2411,7 @@ static NTSTATUS install_private_backing( struct file_view *view )
     /* Prove the filesystem supports decommit before publishing this backing.
      * The sparse file is still zero and has no consumer. */
     if ((status = discard_private_backing( backing, backing->base, backing->size ))) goto failed;
-    if ((status = begin_private_mapping_change( backing, view->base, view->size, PRIVATE_MAPPING_PUBLISH )))
+    if ((status = begin_private_mapping_change( backing, view->base, view->size, PRIVATE_MAPPING_PUBLISH, view->protect & 0xff )))
         goto failed;
     if (mmap( view->base, view->size, get_unix_prot( view->protect ) & ~PROT_EXEC, MAP_SHARED | MAP_FIXED,
               backing->fd, 0 ) == MAP_FAILED)
@@ -2870,6 +2910,187 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 }
 
 
+/* Verify every native mapping in this owned guest span remains the sealed
+ * file-backed PROT_NONE reservation. Registered views and both low ABI slots are rejected
+ * separately. Host allocators cannot enter the guest reservation; fixed native
+ * mappings by cooperating fixture code are detected before the reservation is
+ * removed. NOREPLACE prevents replacing any racing native allocation. */
+static BOOL private_guest_reservation( void *base, size_t size )
+{
+#ifdef __linux__
+    FILE *file;
+    char line[1024], perms[5];
+    unsigned long start, end, offset, inode;
+    unsigned int major, minor;
+    ULONG_PTR cursor = (ULONG_PTR)base, limit = cursor + size;
+    struct reserved_area *area;
+    BOOL owned = FALSE;
+    LIST_FOR_EACH_ENTRY( area, &reserved_areas, struct reserved_area, entry )
+        if ((ULONG_PTR)area->base <= cursor && area->size >= limit - (ULONG_PTR)area->base)
+        { owned = TRUE; break; }
+    if (!owned || !(file = fopen( "/proc/self/maps", "r" ))) return FALSE;
+    while (fgets( line, sizeof(line), file ))
+    {
+        if (sscanf( line, "%lx-%lx %4s %lx %x:%x %lu", &start, &end, perms, &offset,
+                    &major, &minor, &inode ) != 7) continue;
+        if (end <= cursor) continue;
+        if (start > cursor || strcmp( perms, "---p" ) || inode != guest_reservation_ino ||
+            makedev( major, minor ) != guest_reservation_dev ||
+            offset + cursor - start != cursor - WINE_MANAGED_GUEST_START) break;
+        cursor = min( end, limit );
+        if (cursor == limit) break;
+    }
+    fclose( file );
+    return cursor == limit;
+#else
+    return FALSE;
+#endif
+}
+
+static void revoke_private_foreign_view( struct file_view *view )
+{
+    /* Replace only our own registered alias, atomically. A failed replacement
+     * cannot be acknowledged: terminate and let pidfd observe actual mm death. */
+    if (mmap( view->base, view->size, PROT_NONE, MAP_PRIVATE | MAP_FIXED,
+              guest_reservation_fd, (ULONG_PTR)view->base - WINE_MANAGED_GUEST_START ) != view->base)
+        private_mapping_fatal( "foreign view revoke", STATUS_UNSUCCESSFUL, errno_to_status( errno ) );
+    set_page_vprot( view->base, view->size, 0 );
+    unregister_view( view );
+    free_view( view );
+}
+
+void virtual_private_mapping_apc( const union apc_call *call )
+{
+    sigset_t sigset;
+    struct file_view *view = NULL;
+    obj_handle_t handle = call->private_mapping.handle, fd_handle;
+    ULONGLONG token = call->private_mapping.token, generation = call->private_mapping.generation;
+    NTSTATUS status = STATUS_NOT_SUPPORTED, confirm;
+    void *base = NULL, *mapped = MAP_FAILED;
+    size_t size = 0, i;
+    BYTE *pages = NULL;
+    unsigned int state = 0, access = 0;
+    int fd = -1;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (!managed_executor) goto done;
+    if (call->private_mapping.revoke)
+    {
+        WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+            if (view->purpose == MANAGED_VIEW_FOREIGN_PRIVATE && view->foreign_handle == handle &&
+                view->foreign_token == token && view->foreign_generation == generation) break;
+        if (view) revoke_private_foreign_view( view );
+        goto acknowledge;
+    }
+
+    /* Size is obtained first; a second query copies the authoritative page
+     * snapshot while PENDING. The server fences owner mutation meanwhile. */
+    SERVER_START_REQ( query_private_mapping_lease )
+    {
+        req->handle = handle; req->token = token; req->generation = generation;
+        status = wine_server_call( req );
+        if (!status) { state = reply->state; base = wine_server_get_ptr( reply->base ); size = reply->size; access = reply->access; }
+    }
+    SERVER_END_REQ;
+    if (status || state != PRIVATE_MAPPING_LEASE_PENDING) goto acknowledge;
+    if (!base || !size || (ULONG_PTR)base < WINE_MANAGED_GUEST_START ||
+        (ULONG_PTR)base >= WINE_MANAGED_GUEST_END || size > WINE_MANAGED_GUEST_END - (ULONG_PTR)base ||
+        ((ULONG_PTR)base < executor_layout.dispatcher_end &&
+         (ULONG_PTR)base + size > executor_layout.shared_data_start) ||
+        find_view_range( base, size ) || !private_guest_reservation( base, size ))
+    { status = STATUS_CONFLICTING_ADDRESSES; goto complete; }
+    if (!(pages = malloc( size >> page_shift ))) { status = STATUS_NO_MEMORY; goto complete; }
+    SERVER_START_REQ( query_private_mapping_lease )
+    {
+        req->handle = handle; req->token = token; req->generation = generation;
+        wine_server_set_reply( req, pages, size >> page_shift );
+        status = wine_server_call( req );
+        if (!status && (reply->state != PRIVATE_MAPPING_LEASE_PENDING ||
+                       wine_server_reply_size( reply ) != size >> page_shift)) status = STATUS_CANCELLED;
+    }
+    SERVER_END_REQ;
+    if (status) goto complete;
+    SERVER_START_REQ( get_private_mapping_fd )
+    {
+        req->handle = handle; req->token = token; req->generation = generation;
+        status = wine_server_call( req );
+        if (!status)
+        {
+            fd = wine_server_receive_fd( &fd_handle );
+            if (fd == -1 || fd_handle != handle) status = STATUS_INVALID_HANDLE;
+        }
+    }
+    SERVER_END_REQ;
+    if (status) goto complete;
+    if (fcntl( fd, F_SETFD, FD_CLOEXEC ) == -1) { status = errno_to_status( errno ); goto complete; }
+    if (munmap( base, size )) { status = errno_to_status( errno ); goto complete; }
+#ifdef MAP_FIXED_NOREPLACE
+    mapped = mmap( base, size, PROT_NONE, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0 );
+#endif
+    if (mapped != base)
+    {
+        status = mapped == MAP_FAILED ? errno_to_status( errno ) : STATUS_NOT_SUPPORTED;
+        if (mapped != MAP_FAILED) munmap( mapped, size );
+        /* Restore only still-free pages; do not replace a native collision. */
+#ifdef MAP_FIXED_NOREPLACE
+        for (i = 0; i < size; i += page_size)
+        {
+            void *page = (char *)base + i;
+            if (mmap( page, page_size, PROT_NONE, MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+                      guest_reservation_fd, (ULONG_PTR)page - WINE_MANAGED_GUEST_START ) != page && errno != EEXIST)
+                private_mapping_fatal( "foreign reservation rollback", status, errno_to_status( errno ) );
+        }
+#endif
+        goto complete;
+    }
+    close( fd ); fd = -1; /* never retain a stale fd in the executor */
+    status = create_view( &view, base, size, SEC_FILE | SEC_COMMIT );
+    if (status)
+    {
+        if (mmap( base, size, PROT_NONE, MAP_PRIVATE | MAP_FIXED, guest_reservation_fd,
+                  (ULONG_PTR)base - WINE_MANAGED_GUEST_START ) != base)
+            private_mapping_fatal( "foreign view registration rollback", status, errno_to_status( errno ) );
+        goto complete;
+    }
+    view->purpose = MANAGED_VIEW_FOREIGN_PRIVATE;
+    view->foreign_handle = handle; view->foreign_token = token; view->foreign_generation = generation;
+    for (i = 0; i < size >> page_shift; ++i)
+    {
+        BYTE vprot = pages[i] & (VPROT_READ | VPROT_WRITE | VPROT_COMMITTED);
+        if (!(access & FILE_WRITE_DATA)) vprot &= ~VPROT_WRITE;
+        set_page_vprot( (char *)base + i * page_size, page_size, vprot );
+        /* Deliberately bypass force_exec_prot: foreign target aliases are NX. */
+        if (mprotect( (char *)base + i * page_size, page_size,
+                      PROT_READ | ((vprot & VPROT_WRITE) ? PROT_WRITE : 0) ))
+        { status = errno_to_status( errno ); break; }
+    }
+complete:
+    if (fd != -1) close( fd );
+    free( pages ); pages = NULL;
+    if (status && view) { revoke_private_foreign_view( view ); view = NULL; }
+    SERVER_START_REQ( confirm_private_mapping_lease )
+    {
+        req->handle = handle; req->token = token; req->generation = generation; req->status = status;
+        confirm = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    if (!confirm) goto done;
+    /* Mutation/exit won the race while mmap was in flight. Unmap before ACK;
+     * virtual_mutex + blocked APC signals forbid a late map after revocation. */
+    if (view) { revoke_private_foreign_view( view ); view = NULL; }
+acknowledge:
+    SERVER_START_REQ( ack_private_mapping_revoke )
+    {
+        req->handle = handle; req->token = token; req->generation = generation;
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    if (status) private_mapping_fatal( "foreign revoke acknowledgement", status, status );
+done:
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+}
+
+
 /***********************************************************************
  *           map_file_into_view
  *
@@ -3014,7 +3235,7 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
     if (view->private_backing)
     {
         if ((status = begin_private_mapping_change( view->private_backing, base, size,
-                                                    PRIVATE_MAPPING_DECOMMIT ))) return status;
+                                                    PRIVATE_MAPPING_DECOMMIT, 0 ))) return status;
         if (mprotect( base, size, PROT_NONE )) status = errno_to_status( errno );
         else if (!(status = discard_private_backing( view->private_backing, base, size )))
             set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
@@ -3172,7 +3393,7 @@ static NTSTATUS free_private_pages( struct file_view *view, char *base, size_t s
     NTSTATUS status;
 
     if (!backing) return free_pages( view, base, size );
-    if ((status = begin_private_mapping_change( backing, base, size, PRIVATE_MAPPING_RELEASE ))) return status;
+    if ((status = begin_private_mapping_change( backing, base, size, PRIVATE_MAPPING_RELEASE, 0 ))) return status;
     ++backing->refs;  /* free_pages may delete the last view before completion */
     status = finish_private_mapping_change( backing, free_pages( view, base, size ) );
     release_private_backing( backing );
@@ -4411,8 +4632,26 @@ void virtual_init(void)
                 !(*preload_info)[2].size;
             if (valid)
             {
-                executor_layout = *executor;
-                managed_executor = TRUE;
+                struct stat stat;
+                int seals;
+                valid = executor->guest_reservation_flags == WINE_MANAGED_EXECUTOR_RESERVATION_FILE_BACKED_SEALED &&
+                    executor->guest_reservation_fd >= 0 && !fstat( executor->guest_reservation_fd, &stat ) &&
+                    S_ISREG( stat.st_mode ) && stat.st_size == WINE_MANAGED_GUEST_END - WINE_MANAGED_GUEST_START &&
+                    (seals = fcntl( executor->guest_reservation_fd, F_GET_SEALS )) != -1 &&
+                    (seals & (F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_WRITE | F_SEAL_SEAL)) ==
+                    (F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_WRITE | F_SEAL_SEAL);
+                if (valid)
+                {
+                    guest_reservation_fd = executor->guest_reservation_fd;
+                    guest_reservation_dev = stat.st_dev;
+                    guest_reservation_ino = stat.st_ino;
+                    valid = fcntl( guest_reservation_fd, F_SETFD, FD_CLOEXEC ) != -1;
+                }
+                if (valid)
+                {
+                    executor_layout = *executor;
+                    managed_executor = TRUE;
+                }
             }
         }
         else valid = FALSE;
@@ -5948,7 +6187,7 @@ void virtual_set_force_exec( BOOL enable )
             /* file mappings are always accessible */
             BYTE commit;
 
-            if (view->protect & VPROT_NATIVE)
+            if (view->protect & VPROT_NATIVE || view->purpose == MANAGED_VIEW_FOREIGN_PRIVATE)
                 continue;
 
             commit = is_view_valloc( view ) ? 0 : VPROT_COMMITTED;
@@ -6174,9 +6413,10 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     else if (type & MEM_RESET)
     {
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
+        else if (view->purpose == MANAGED_VIEW_FOREIGN_PRIVATE) status = STATUS_ACCESS_DENIED;
         else if (view->private_backing)
         {
-            if (!(status = begin_private_mapping_change( view->private_backing, base, size, PRIVATE_MAPPING_RESET )))
+            if (!(status = begin_private_mapping_change( view->private_backing, base, size, PRIVATE_MAPPING_RESET, 0 )))
             {
                 /* MEM_RESET does not promise zero contents. DONTNEED on a
                  * shared sparse file retains the authoritative backing. */
@@ -8034,6 +8274,11 @@ static NTSTATUS set_dirty_state_information( ULONG_PTR count, MEMORY_RANGE_ENTRY
         if (!view)
         {
             ret = STATUS_MEMORY_NOT_ALLOCATED;
+            break;
+        }
+        if (view->purpose == MANAGED_VIEW_FOREIGN_PRIVATE)
+        {
+            ret = STATUS_ACCESS_DENIED;
             break;
         }
         if (use_kernel_writewatch) reset_write_watches( base, size );

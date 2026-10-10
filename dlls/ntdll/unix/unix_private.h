@@ -298,6 +298,7 @@ extern void *anon_mmap_alloc( size_t size, int prot );
 extern void virtual_init(void);
 extern BOOL virtual_is_managed_target(void);
 extern BOOL virtual_is_managed_executor(void);
+extern void virtual_private_mapping_apc( const union apc_call *call );
 extern NTSTATUS virtual_map_syscall_dispatcher( void *dispatcher );
 extern ULONG_PTR get_system_affinity_mask(void);
 extern void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 );

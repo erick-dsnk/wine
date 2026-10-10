@@ -486,7 +486,8 @@ enum apc_type
     APC_MAP_VIEW_EX,
     APC_UNMAP_VIEW,
     APC_CREATE_THREAD,
-    APC_DUP_HANDLE
+    APC_DUP_HANDLE,
+    APC_PRIVATE_MAPPING
 };
 
 struct user_apc
@@ -624,6 +625,14 @@ union apc_call
         unsigned int     attributes;
         unsigned int     options;
     } dup_handle;
+    struct
+    {
+        enum apc_type type;
+        obj_handle_t handle;
+        unsigned __int64 token;
+        unsigned __int64 generation;
+        unsigned int revoke;
+    } private_mapping;
 };
 
 union apc_result
@@ -1169,6 +1178,8 @@ struct init_process_done_request
     client_ptr_t teb;
     client_ptr_t peb;
     client_ptr_t ldt_copy;
+    unsigned int managed_role;
+    char __pad_44[4];
 };
 struct init_process_done_reply
 {
@@ -6300,12 +6311,14 @@ struct begin_private_mapping_change_request
     mem_size_t size;
     unsigned __int64 generation;
     unsigned int operation;
-    char __pad_52[4];
+    unsigned int vprot;
 };
 struct begin_private_mapping_change_reply
 {
     struct reply_header __header;
     unsigned __int64 generation;
+    obj_handle_t ready;
+    char __pad_20[4];
 };
 
 struct finish_private_mapping_change_request
@@ -6339,8 +6352,16 @@ struct query_private_mapping_reply
     int updating;
 };
 
-/* Deliberately unavailable until mapped aliases can be revoked. Checking a
- * generation before a read cannot make a stale foreign mmap safe. */
+enum private_mapping_lease_state
+{
+    PRIVATE_MAPPING_LEASE_PENDING = 1,
+    PRIVATE_MAPPING_LEASE_LIVE,
+    PRIVATE_MAPPING_LEASE_REVOKING,
+    PRIVATE_MAPPING_LEASE_REVOKED
+};
+
+/* Internal opt-in managed TARGET -> EXECUTOR lease. The server reserves the
+ * lease before queuing the map APC and fences every owner VM mutation. */
 struct acquire_private_mapping_request
 {
     struct request_header __header;
@@ -6351,6 +6372,100 @@ struct acquire_private_mapping_request
     char __pad_36[4];
 };
 struct acquire_private_mapping_reply
+{
+    struct reply_header __header;
+    obj_handle_t handle;
+    obj_handle_t ready;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+    unsigned __int64 mapping_id;
+};
+
+struct lookup_private_mapping_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    client_ptr_t address;
+};
+struct lookup_private_mapping_reply
+{
+    struct reply_header __header;
+    obj_handle_t handle;
+    char __pad_12[4];
+    client_ptr_t base;
+    mem_size_t size;
+    unsigned __int64 generation;
+    unsigned __int64 mapping_id;
+    /* VARARG(pages,bytes); */
+};
+
+struct query_private_mapping_lease_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+};
+struct query_private_mapping_lease_reply
+{
+    struct reply_header __header;
+    unsigned int state;
+    unsigned int status;
+    unsigned int access;
+    char __pad_20[4];
+    client_ptr_t base;
+    mem_size_t size;
+    /* VARARG(pages,bytes); */
+};
+
+struct confirm_private_mapping_lease_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+    unsigned int status;
+    char __pad_36[4];
+};
+struct confirm_private_mapping_lease_reply
+{
+    struct reply_header __header;
+};
+
+struct release_private_mapping_lease_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+};
+struct release_private_mapping_lease_reply
+{
+    struct reply_header __header;
+    obj_handle_t ready;
+    char __pad_12[4];
+};
+
+struct ack_private_mapping_revoke_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+};
+struct ack_private_mapping_revoke_reply
+{
+    struct reply_header __header;
+};
+
+struct get_private_mapping_fd_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+    unsigned __int64 token;
+    unsigned __int64 generation;
+};
+struct get_private_mapping_fd_reply
 {
     struct reply_header __header;
 };
@@ -6673,6 +6788,12 @@ enum request
     REQ_finish_private_mapping_change,
     REQ_query_private_mapping,
     REQ_acquire_private_mapping,
+    REQ_lookup_private_mapping,
+    REQ_query_private_mapping_lease,
+    REQ_confirm_private_mapping_lease,
+    REQ_release_private_mapping_lease,
+    REQ_ack_private_mapping_revoke,
+    REQ_get_private_mapping_fd,
     REQ_NB_REQUESTS
 };
 
@@ -6995,6 +7116,12 @@ union generic_request
     struct finish_private_mapping_change_request finish_private_mapping_change_request;
     struct query_private_mapping_request query_private_mapping_request;
     struct acquire_private_mapping_request acquire_private_mapping_request;
+    struct lookup_private_mapping_request lookup_private_mapping_request;
+    struct query_private_mapping_lease_request query_private_mapping_lease_request;
+    struct confirm_private_mapping_lease_request confirm_private_mapping_lease_request;
+    struct release_private_mapping_lease_request release_private_mapping_lease_request;
+    struct ack_private_mapping_revoke_request ack_private_mapping_revoke_request;
+    struct get_private_mapping_fd_request get_private_mapping_fd_request;
 };
 union generic_reply
 {
@@ -7315,8 +7442,14 @@ union generic_reply
     struct finish_private_mapping_change_reply finish_private_mapping_change_reply;
     struct query_private_mapping_reply query_private_mapping_reply;
     struct acquire_private_mapping_reply acquire_private_mapping_reply;
+    struct lookup_private_mapping_reply lookup_private_mapping_reply;
+    struct query_private_mapping_lease_reply query_private_mapping_lease_reply;
+    struct confirm_private_mapping_lease_reply confirm_private_mapping_lease_reply;
+    struct release_private_mapping_lease_reply release_private_mapping_lease_reply;
+    struct ack_private_mapping_revoke_reply ack_private_mapping_revoke_reply;
+    struct get_private_mapping_fd_reply get_private_mapping_fd_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 931
+#define SERVER_PROTOCOL_VERSION 935
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
