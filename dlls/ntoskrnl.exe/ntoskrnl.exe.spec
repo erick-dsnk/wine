@@ -1715,3 +1715,5 @@
 
 @ cdecl wine_ntoskrnl_main_loop(long)
 @ cdecl wine_enumerate_root_devices(wstr)
+
+@ cdecl wine_ntoskrnl_executor_worker(long ptr long ptr)

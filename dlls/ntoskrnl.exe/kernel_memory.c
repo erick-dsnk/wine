@@ -57,6 +57,59 @@ static NTSTATUS arena_status;
 static BOOL arena_enabled;
 static HANDLE arena_section;
 static char *arena_base;
+static BOOL arena_adopted;
+/* 0 = uninitialized, 1 = adoption in progress, 2 = local initialization in
+ * progress, 3 = ready, 4 = failed. Adoption is deliberately a startup-only
+ * operation and must precede every allocator call in an executor. */
+static volatile LONG arena_state;
+
+static BOOL parse_arena_base( ULONG_PTR *base )
+{
+#ifndef __x86_64__
+    return FALSE;
+#else
+    WCHAR value[32];
+    WCHAR *p;
+    ULONG_PTR result = 0;
+    unsigned int digits = 0;
+    DWORD len = GetEnvironmentVariableW( L"WINE_SHARED_KERNEL_MEMORY_BASE", value, ARRAY_SIZE(value) );
+
+    if (!len) return FALSE;
+    if (len >= ARRAY_SIZE(value)) return FALSE;
+    p = value;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+    for (; *p; ++p)
+    {
+        unsigned int digit;
+        if (*p >= '0' && *p <= '9') digit = *p - '0';
+        else if (*p >= 'a' && *p <= 'f') digit = *p - 'a' + 10;
+        else if (*p >= 'A' && *p <= 'F') digit = *p - 'A' + 10;
+        else return FALSE;
+        if (result > ((ULONG_PTR)-1 - digit) / 16) return FALSE;
+        result = result * 16 + digit;
+        ++digits;
+    }
+    if (!digits || !result || (result & 0xffff)
+            || result < 0x400000000000ULL || result > 0x7fffffffffffull - ARENA_SIZE)
+        return FALSE;
+    *base = result;
+    return TRUE;
+#endif
+}
+
+static NTSTATUS protect_arena_view( char *base )
+{
+    SIZE_T size = ARENA_EXEC_OFFSET;
+    void *protect_base = base;
+    ULONG old_protect;
+    NTSTATUS status;
+
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_base, &size,
+                                     PAGE_READWRITE, &old_protect );
+    if (status || protect_base != base || size != ARENA_EXEC_OFFSET)
+        return status ? status : STATUS_CONFLICTING_ADDRESSES;
+    return STATUS_SUCCESS;
+}
 
 static struct arena_block *block_at( SIZE_T offset )
 {
@@ -70,27 +123,82 @@ static BOOL WINAPI initialize_arena( INIT_ONCE *once, void *param, void **contex
     LARGE_INTEGER size;
     SIZE_T view_size = ARENA_SIZE, protect_size = ARENA_EXEC_OFFSET;
     void *protect_base;
+    void *map_base;
     ULONG old_protect;
     WCHAR value[2];
+    ULONG_PTR fixed_base = 0;
+    LONG previous;
     unsigned int i;
+
+    previous = InterlockedCompareExchange( &arena_state, 2, 0 );
+    while (previous == 1)
+    {
+        YieldProcessor();
+        previous = InterlockedCompareExchange( &arena_state, 2, 0 );
+    }
+    if (previous == 3 && arena_adopted)
+    {
+        header = (struct arena_header *)arena_base;
+        if (header->magic != ARENA_MAGIC || header->first[0] != PAGE_SIZE
+                || header->end[0] != ARENA_EXEC_OFFSET || header->first[1] != ARENA_EXEC_OFFSET
+                || header->end[1] != ARENA_SIZE)
+        {
+            arena_status = STATUS_INVALID_IMAGE_FORMAT;
+            InterlockedExchange( &arena_state, 4 );
+            return TRUE;
+        }
+        arena_status = protect_arena_view( arena_base );
+        if (arena_status) InterlockedExchange( &arena_state, 4 );
+        return TRUE;
+    }
+    if (previous != 0)
+    {
+        arena_status = STATUS_INVALID_DEVICE_STATE;
+        InterlockedExchange( &arena_state, 4 );
+        return TRUE;
+    }
 
     arena_enabled = GetEnvironmentVariableW( L"WINE_SHARED_KERNEL_MEMORY", value, ARRAY_SIZE(value) ) == 1
             && value[0] == '1';
     TRACE( "shared kernel memory opt-in %u\n", arena_enabled );
-    if (!arena_enabled) return TRUE;
+    if (!arena_enabled)
+    {
+        InterlockedExchange( &arena_state, 3 );
+        return TRUE;
+    }
 #ifndef __x86_64__
     arena_status = STATUS_NOT_SUPPORTED;
     ERR( "shared kernel arena is only implemented for x86_64\n" );
+    InterlockedExchange( &arena_state, 4 );
     return TRUE;
 #endif
 
     size.QuadPart = ARENA_SIZE;
+    if (GetEnvironmentVariableW( L"WINE_SHARED_KERNEL_MEMORY_BASE", value, ARRAY_SIZE(value) ))
+    {
+        /* The value buffer above is intentionally small; parse the full value
+         * separately and fail closed on malformed or truncated input. */
+        if (!parse_arena_base( &fixed_base ))
+        {
+            arena_status = STATUS_INVALID_PARAMETER;
+            goto failed;
+        }
+    }
     arena_status = NtCreateSection( &arena_section, SECTION_ALL_ACCESS, NULL, &size,
                                    PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL );
     if (arena_status) goto failed;
-    arena_status = NtMapViewOfSection( arena_section, NtCurrentProcess(), (void **)&arena_base,
+    map_base = (void *)fixed_base;
+    view_size = ARENA_SIZE;
+    arena_status = NtMapViewOfSection( arena_section, NtCurrentProcess(), &map_base,
                                       0, 0, NULL, &view_size, ViewUnmap, 0, PAGE_EXECUTE_READWRITE );
     if (arena_status) goto failed;
+    if (view_size != ARENA_SIZE || (fixed_base && (ULONG_PTR)map_base != fixed_base))
+    {
+        NtUnmapViewOfSection( NtCurrentProcess(), map_base );
+        arena_status = STATUS_CONFLICTING_ADDRESSES;
+        goto failed;
+    }
+    arena_base = map_base;
 
     /* Separate NX and executable page classes; an executable allocation never
      * shares a page with an NX allocation. The shared arena header is NX. */
@@ -113,6 +221,7 @@ static BOOL WINAPI initialize_arena( INIT_ONCE *once, void *param, void **contex
     }
     TRACE( "experimental shared kernel section %p at %p, size %#x\n",
            arena_section, arena_base, ARENA_SIZE );
+    InterlockedExchange( &arena_state, 3 );
     return TRUE;
 
 failed:
@@ -123,6 +232,7 @@ failed:
     ERR( "shared kernel arena initialization failed, status %#lx\n", arena_status );
     /* A failed configured arena must not produce private fallback allocations.
      * Keep the failure for the lifetime of this module. */
+    InterlockedExchange( &arena_state, 4 );
     return TRUE;
 }
 
@@ -131,6 +241,67 @@ NTSTATUS kernel_memory_init(void)
     InitOnceExecuteOnce( &arena_once, initialize_arena, NULL, NULL );
     return arena_status;
 }
+
+/* Return the real backing section and fixed view metadata so the executor
+ * launcher can inherit the section handle and map it at the same address. */
+NTSTATUS kernel_memory_export( HANDLE *section, void **base, SIZE_T *size )
+{
+    NTSTATUS status;
+
+    if (!section || !base || !size) return STATUS_INVALID_PARAMETER;
+    if ((status = kernel_memory_init())) return status;
+    if (!arena_enabled || !arena_section || !arena_base) return STATUS_NOT_SUPPORTED;
+    *section = arena_section;
+    *base = arena_base;
+    *size = ARENA_SIZE;
+    return STATUS_SUCCESS;
+}
+
+/* Adopt the executor parent's inherited section before kernel_memory_init or
+ * any allocation. The existing header is validated and never reinitialized. */
+NTSTATUS kernel_memory_adopt( HANDLE section, void *base, SIZE_T size )
+{
+    SIZE_T view_size = size;
+    void *view_base = base;
+    struct arena_header *header;
+    NTSTATUS status;
+
+    if (!section || !base || size != ARENA_SIZE || ((ULONG_PTR)base & 0xffff))
+        return STATUS_INVALID_PARAMETER;
+    if (InterlockedCompareExchange( &arena_state, 1, 0 ) != 0)
+        return STATUS_INVALID_DEVICE_STATE;
+    status = NtMapViewOfSection( section, NtCurrentProcess(), &view_base, 0, 0, NULL,
+                                 &view_size, ViewUnmap, 0, PAGE_EXECUTE_READWRITE );
+    if (status) goto failed;
+    if (view_base != base || view_size != ARENA_SIZE)
+    {
+        NtUnmapViewOfSection( NtCurrentProcess(), view_base );
+        status = STATUS_CONFLICTING_ADDRESSES;
+        goto failed;
+    }
+    header = view_base;
+    if (header->magic != ARENA_MAGIC || header->first[0] != PAGE_SIZE
+            || header->end[0] != ARENA_EXEC_OFFSET || header->first[1] != ARENA_EXEC_OFFSET
+            || header->end[1] != ARENA_SIZE)
+    {
+        NtUnmapViewOfSection( NtCurrentProcess(), view_base );
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto failed;
+    }
+    arena_section = section;
+    arena_base = view_base;
+    arena_enabled = TRUE;
+    arena_adopted = TRUE;
+    arena_status = STATUS_SUCCESS;
+    InterlockedExchange( &arena_state, 3 );
+    return STATUS_SUCCESS;
+
+failed:
+    arena_status = status;
+    InterlockedExchange( &arena_state, 4 );
+    return status;
+}
+
 
 BOOL kernel_memory_enabled(void)
 {

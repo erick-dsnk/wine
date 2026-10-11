@@ -406,6 +406,7 @@ extern void set_async_direct_result( HANDLE *async_handle, unsigned int options,
 extern struct cpu_topology_override *get_cpu_topology_override(void);
 
 extern NTSTATUS unixcall_wine_dbg_write( void *args );
+extern NTSTATUS unixcall_map_shared_driver_image( void *args );
 extern NTSTATUS unixcall_wine_server_call( void *args );
 extern NTSTATUS unixcall_wine_server_fd_to_handle( void *args );
 extern NTSTATUS unixcall_wine_server_handle_to_fd( void *args );

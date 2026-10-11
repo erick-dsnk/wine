@@ -24,6 +24,7 @@
 #include <assert.h>
 
 #include "ntoskrnl_private.h"
+#include "rtlsupportapi.h"
 #include "excpt.h"
 #include "winreg.h"
 #include "ntsecapi.h"
@@ -31,10 +32,13 @@
 #include "ddk/csq.h"
 #include "wine/server.h"
 #include "wine/svcctl.h"
+#include "wine/exception.h"
+#include "wine/managed_layout.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(ntoskrnl);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
 
+PEPROCESS PsInitialSystemProcess = NULL;
 BOOLEAN KdDebuggerEnabled = FALSE;
 ULONG InitSafeBootMode = 0;
 USHORT NtBuildNumber = 0;
@@ -66,7 +70,154 @@ static DWORD request_thread;
 /* tid of the client thread */
 static DWORD client_tid;
 
+/* Bounded, opt-in serial driver execution experiment.  Only the explicitly
+ * declared complete private extents are changed; the executor's driver,
+ * runtime, kernel objects and stack remain in its host address space. */
+#define ATTACH_MAX_RANGES 8
+#define ATTACH_MAX_DEPTH 8
+
+struct attach_range
+{
+    void *base;
+    SIZE_T size;
+};
+
+struct attach_lease
+{
+    HANDLE handle;
+    ULONGLONG token;
+    ULONGLONG generation;
+};
+
+struct attach_frame
+{
+    KAPC_STATE *state;
+    PEPROCESS process;
+};
+
+static struct attach_range attach_ranges[ATTACH_MAX_RANGES];
+static unsigned int attach_range_count;
+static BOOL attach_enabled;
+static struct
+{
+    DWORD tid;
+    struct _KTHREAD *thread;
+    PEPROCESS caller;
+    PEPROCESS process;
+    struct attach_lease leases[ATTACH_MAX_RANGES];
+    struct attach_frame frames[ATTACH_MAX_DEPTH];
+    unsigned int depth;
+} attach_context;
+DECLARE_CRITICAL_SECTION(attach_dispatch_cs);
+
+/* Each physical worker owns its Unix mm and attachment context.  The service
+ * coordinator alone consumes the device-manager request stream. */
+#define EXECUTOR_COUNT 2
+#define EXECUTOR_IMPORTS 1024
+#define EXECUTOR_IMAGES 16
+#define EXECUTOR_DEPENDENCIES 32
+#define EXECUTOR_IDLE 0
+#define EXECUTOR_REQUEST 1
+#define EXECUTOR_RUNNING 2
+#define EXECUTOR_DONE 3
+#define EXECUTOR_STOP 4
+#define EXECUTOR_TIMEOUT 20000
+#define EXECUTOR_STACK_SIZE (256 * 1024)
+
+struct executor_import
+{
+    ULONG rva;
+    ULONG_PTR value;
+};
+
+struct executor_module
+{
+    HMODULE base;
+    SIZE_T size;
+    unsigned int import_count;
+    WCHAR path[MAX_PATH];
+    struct executor_import imports[EXECUTOR_IMPORTS];
+};
+
+struct executor_image
+{
+    HMODULE base;
+    SIZE_T size;
+    HANDLE section;
+    unsigned int import_count;
+    WCHAR path[MAX_PATH];
+    struct executor_import imports[EXECUTOR_IMPORTS];
+    unsigned int dependency_count, order_count;
+    unsigned int dependency_order[EXECUTOR_DEPENDENCIES];
+    struct executor_module dependencies[EXECUTOR_DEPENDENCIES];
+};
+
+struct executor_slot
+{
+    volatile LONG state;
+    ULONGLONG started;
+    NTSTATUS status;
+    HANDLE request_event, done_event, ready_event;
+    HANDLE manager, registry_mutex;
+    PEPROCESS system_process;
+    struct _KTHREAD *thread;
+    DEVICE_OBJECT *device;
+    IRP *irp;
+    struct irp_data *irp_data;
+    struct executor_image *image;
+    HANDLE image_section;
+    void *dispatch_stack;
+};
+
+struct executor_worker
+{
+    struct executor_slot *slot;
+    HANDLE process;
+};
+
+static BOOL executor_worker_process;
+static HANDLE executor_manager, executor_registry_mutex;
+static INIT_ONCE executor_mutex_once = INIT_ONCE_STATIC_INIT;
+static struct executor_worker executor_workers[EXECUTOR_COUNT];
+static struct executor_image *executor_images[EXECUTOR_IMAGES];
+static unsigned int executor_image_count;
+DECLARE_CRITICAL_SECTION(executor_lifecycle_cs);
 static HANDLE ntoskrnl_heap;
+
+static BOOL concurrent_driver_enabled(void)
+{
+    WCHAR value[4];
+    return GetEnvironmentVariableW( L"WINE_EXPERIMENTAL_DRIVER_CONCURRENCY", value, ARRAY_SIZE(value) ) == 1 && value[0] == '2';
+}
+
+static BOOL WINAPI initialize_executor_mutex( INIT_ONCE *once, void *param, void **context )
+{
+    SECURITY_ATTRIBUTES attributes = {sizeof(attributes), NULL, TRUE};
+    if (!executor_registry_mutex) executor_registry_mutex = CreateMutexW( &attributes, FALSE, NULL );
+    return !!executor_registry_mutex;
+}
+
+static void lock_executor_registry(void)
+{
+    DWORD ret;
+    if (!concurrent_driver_enabled()) return;
+    if (!InitOnceExecuteOnce( &executor_mutex_once, initialize_executor_mutex, NULL, NULL ))
+        RtlRaiseStatus( STATUS_NO_MEMORY );
+    ret = WaitForSingleObject( executor_registry_mutex, EXECUTOR_TIMEOUT );
+    /* Abandonment is an unresolved object transition, not permission to reuse it. */
+    if (ret != WAIT_OBJECT_0) NtTerminateProcess( NtCurrentProcess(), STATUS_INVALID_DEVICE_STATE );
+}
+
+static void unlock_executor_registry(void)
+{
+    if (concurrent_driver_enabled()) ReleaseMutex( executor_registry_mutex );
+}
+
+static NTSTATUS queue_executor_irp( DEVICE_OBJECT *device, IRP *irp, struct irp_data *data );
+static NTSTATUS prepare_executor_image( HMODULE module );
+static void drain_executor_completions(void);
+static void stop_executor_workers(void);
+
 
 static void *ldr_notify_cookie;
 
@@ -79,6 +230,7 @@ struct irp_data
     IRP *irp;
     BOOL async;
     BOOL complete;
+    BOOL executor;
 };
 
 static int wine_drivers_rb_compare( const void *key, const struct wine_rb_entry *entry )
@@ -115,6 +267,8 @@ static HANDLE get_device_manager(void)
 {
     static HANDLE device_manager;
     HANDLE handle = 0, ret = device_manager;
+
+    if (executor_manager) return executor_manager;
 
     if (!ret)
     {
@@ -214,6 +368,7 @@ void WINAPI ObDereferenceObject( void *obj )
         return;
     }
 
+    lock_executor_registry();
     EnterCriticalSection( &obref_cs );
 
     ref = --header->ref;
@@ -237,6 +392,7 @@ void WINAPI ObDereferenceObject( void *obj )
     }
 
     LeaveCriticalSection( &obref_cs );
+    unlock_executor_registry();
 }
 
 void ObReferenceObject( void *obj )
@@ -250,6 +406,7 @@ void ObReferenceObject( void *obj )
         return;
     }
 
+    lock_executor_registry();
     EnterCriticalSection( &obref_cs );
 
     ref = ++header->ref;
@@ -266,6 +423,7 @@ void ObReferenceObject( void *obj )
     }
 
     LeaveCriticalSection( &obref_cs );
+    unlock_executor_registry();
 }
 
 /***********************************************************************
@@ -296,6 +454,7 @@ NTSTATUS kernel_object_from_handle( HANDLE handle, POBJECT_TYPE type, void **ret
     void *obj;
     NTSTATUS status;
 
+    lock_executor_registry();
     EnterCriticalSection( &handle_map_cs );
 
     SERVER_START_REQ( get_kernel_object_ptr )
@@ -309,6 +468,7 @@ NTSTATUS kernel_object_from_handle( HANDLE handle, POBJECT_TYPE type, void **ret
     if (status)
     {
         LeaveCriticalSection( &handle_map_cs );
+        unlock_executor_registry();
         return status;
     }
 
@@ -322,6 +482,7 @@ NTSTATUS kernel_object_from_handle( HANDLE handle, POBJECT_TYPE type, void **ret
         if (status)
         {
             LeaveCriticalSection( &handle_map_cs );
+            unlock_executor_registry();
             return status;
         }
         if (!type)
@@ -338,6 +499,7 @@ NTSTATUS kernel_object_from_handle( HANDLE handle, POBJECT_TYPE type, void **ret
             {
                 FIXME("Unsupported type %s\n", debugstr_us(&type_info->TypeName));
                 LeaveCriticalSection( &handle_map_cs );
+                unlock_executor_registry();
                 return STATUS_INVALID_HANDLE;
             }
         }
@@ -345,6 +507,7 @@ NTSTATUS kernel_object_from_handle( HANDLE handle, POBJECT_TYPE type, void **ret
                                            type_info->TypeName.Length / sizeof(WCHAR), FALSE) )
         {
             LeaveCriticalSection( &handle_map_cs );
+            unlock_executor_registry();
             return STATUS_OBJECT_TYPE_MISMATCH;
         }
 
@@ -360,9 +523,11 @@ NTSTATUS kernel_object_from_handle( HANDLE handle, POBJECT_TYPE type, void **ret
     else if (type && ObGetObjectType( obj ) != type) status = STATUS_OBJECT_TYPE_MISMATCH;
 
     LeaveCriticalSection( &handle_map_cs );
+    unlock_executor_registry();
     if (!status) *ret = obj;
     return status;
 }
+
 
 /***********************************************************************
  *           ObReferenceObjectByHandle    (NTOSKRNL.EXE.@)
@@ -496,6 +661,11 @@ static NTSTATUS WINAPI dispatch_irp_completion( DEVICE_OBJECT *device, IRP *irp,
     NTSTATUS status;
     ULONG out_size;
 
+    if (executor_worker_process)
+    {
+        irp_data->complete = TRUE;
+        return STATUS_MORE_PROCESSING_REQUIRED;
+    }
     EnterCriticalSection( &irp_completion_cs );
 
     irp_data->complete = TRUE;
@@ -533,6 +703,787 @@ struct dispatch_context
     void  *in_buff;
 };
 
+static BOOL parse_attach_hex( const WCHAR **str, ULONGLONG *value )
+{
+    const WCHAR *p = *str;
+    unsigned int digit, count = 0;
+
+    *value = 0;
+    while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))
+    {
+        digit = *p <= '9' ? *p - '0' : (*p | 0x20) - 'a' + 10;
+        if (++count > 16) return FALSE;
+        *value = (*value << 4) | digit;
+        ++p;
+    }
+    *str = p;
+    return count != 0;
+}
+
+static NTSTATUS initialize_attach_experiment(void)
+{
+    WCHAR value[512], concurrency[4];
+    const WCHAR *p = value;
+    ULONGLONG base, size;
+    unsigned int i;
+    DWORD len;
+
+    attach_enabled = FALSE;
+    attach_range_count = 0;
+    SetLastError( ERROR_SUCCESS );
+    len = GetEnvironmentVariableW( L"WINE_EXPERIMENTAL_DRIVER_CONCURRENCY", concurrency, ARRAY_SIZE(concurrency) );
+    if (len || GetLastError() != ERROR_ENVVAR_NOT_FOUND)
+        if (len != 1 || concurrency[0] != '2') return STATUS_INVALID_PARAMETER;
+    SetLastError( ERROR_SUCCESS );
+    len = GetEnvironmentVariableW( L"WINE_EXPERIMENTAL_ATTACH_RANGES", value, ARRAY_SIZE(value) );
+    if (!len && GetLastError() == ERROR_ENVVAR_NOT_FOUND) return STATUS_SUCCESS;
+    attach_enabled = TRUE;
+    if (!len) return STATUS_INVALID_PARAMETER;
+#ifndef __x86_64__
+    return STATUS_NOT_SUPPORTED;
+#endif
+    if (len >= ARRAY_SIZE(value) || !kernel_memory_enabled()) return STATUS_NOT_SUPPORTED;
+    do
+    {
+        if (attach_range_count == ATTACH_MAX_RANGES || !parse_attach_hex( &p, &base ) || *p++ != ':' ||
+            !parse_attach_hex( &p, &size ) || base < WINE_MANAGED_GUEST_START ||
+            base >= WINE_MANAGED_GUEST_END || !size || size > WINE_MANAGED_GUEST_END - base ||
+            (base & 0xffff) || (size & (PAGE_SIZE - 1)) ||
+            (base < WINE_MANAGED_DISPATCH_END && base + size > WINE_MANAGED_KUSER_START))
+            return STATUS_INVALID_PARAMETER;
+        for (i = 0; i < attach_range_count; ++i)
+            if (base < (ULONG_PTR)attach_ranges[i].base + attach_ranges[i].size &&
+                base + size > (ULONG_PTR)attach_ranges[i].base) return STATUS_INVALID_PARAMETER;
+        attach_ranges[attach_range_count].base = (void *)(ULONG_PTR)base;
+        attach_ranges[attach_range_count++].size = size;
+    } while (*p == ',' && ++p);
+    if (*p) return STATUS_INVALID_PARAMETER;
+    TRACE( "experimental serial attachment configured for %u private extents\n", attach_range_count );
+    return STATUS_SUCCESS;
+}
+
+static void DECLSPEC_NORETURN attach_experiment_fatal( const char *stage, NTSTATUS status )
+{
+    ERR( "experimental attachment cannot safely continue at %s, status %#lx\n", stage, status );
+    NtTerminateProcess( NtCurrentProcess(), status );
+    RtlRaiseStatus( status );
+}
+
+static NTSTATUS wait_attach_ready( HANDLE ready )
+{
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    timeout.QuadPart = -5 * (LONGLONG)10000000;
+    status = NtWaitForSingleObject( ready, FALSE, &timeout );
+    NtClose( ready );
+    return status;
+}
+
+static NTSTATUS query_attach_lease( const struct attach_lease *lease, unsigned int *state )
+{
+    NTSTATUS status, result = STATUS_UNSUCCESSFUL;
+
+    SERVER_START_REQ( query_private_mapping_lease )
+    {
+        req->handle = wine_server_obj_handle( lease->handle );
+        req->token = lease->token;
+        req->generation = lease->generation;
+        status = wine_server_call( req );
+        if (!status) { *state = reply->state; result = reply->status; }
+    }
+    SERVER_END_REQ;
+    return status ? status : result;
+}
+
+static void release_attach_views(void)
+{
+    unsigned int i, state;
+    NTSTATUS status;
+    HANDLE ready;
+
+    for (i = 0; i < attach_range_count; ++i)
+    {
+        struct attach_lease *lease = &attach_context.leases[i];
+        if (!lease->handle) continue;
+        ready = NULL;
+        SERVER_START_REQ( release_private_mapping_lease )
+        {
+            req->handle = wine_server_obj_handle( lease->handle );
+            req->token = lease->token;
+            req->generation = lease->generation;
+            status = wine_server_call( req );
+            if (!status) ready = wine_server_ptr_handle( reply->ready );
+        }
+        SERVER_END_REQ;
+        if (status) attach_experiment_fatal( "release", status );
+        if ((status = wait_attach_ready( ready ))) attach_experiment_fatal( "revoke wait", status );
+        state = 0;
+        query_attach_lease( lease, &state );
+        if (state != PRIVATE_MAPPING_LEASE_REVOKED)
+            attach_experiment_fatal( "revoke acknowledgement", STATUS_INVALID_DEVICE_STATE );
+        NtClose( lease->handle );
+        memset( lease, 0, sizeof(*lease) );
+    }
+}
+
+static NTSTATUS acquire_attach_views( PEPROCESS process )
+{
+    unsigned int i, state;
+    HANDLE handle, ready;
+    NTSTATUS status;
+
+    if ((status = ObOpenObjectByPointer( process, 0, NULL, PROCESS_VM_READ, PsProcessType, KernelMode, &handle )))
+        return status;
+    for (i = 0; i < attach_range_count; ++i)
+    {
+        struct attach_lease *lease = &attach_context.leases[i];
+        ready = NULL;
+        SERVER_START_REQ( acquire_private_mapping )
+        {
+            req->process = wine_server_obj_handle( handle );
+            req->address = wine_server_client_ptr( attach_ranges[i].base );
+            req->size = attach_ranges[i].size;
+            req->access = FILE_READ_DATA;
+            status = wine_server_call( req );
+            if (!status)
+            {
+                lease->handle = wine_server_ptr_handle( reply->handle );
+                lease->token = reply->token;
+                lease->generation = reply->generation;
+                ready = wine_server_ptr_handle( reply->ready );
+            }
+        }
+        SERVER_END_REQ;
+        /* An absent declared extent deliberately remains inaccessible in the
+         * executor's guest reservation.  No other admission failure is ignored. */
+        if (status == STATUS_NOT_FOUND) { status = STATUS_SUCCESS; continue; }
+        if (status || (status = wait_attach_ready( ready ))) break;
+        state = 0;
+        status = query_attach_lease( lease, &state );
+        if (!status && state != PRIVATE_MAPPING_LEASE_LIVE) status = STATUS_INVALID_DEVICE_STATE;
+        if (status) break;
+    }
+    NtClose( handle );
+    if (status) release_attach_views();
+    return status;
+}
+
+static NTSTATUS switch_attach_views( PEPROCESS process )
+{
+    NTSTATUS status, restore;
+
+    release_attach_views();
+    if ((status = acquire_attach_views( process )))
+    {
+        if ((restore = acquire_attach_views( attach_context.process )))
+            attach_experiment_fatal( "restore previous process", restore );
+    }
+    return status;
+}
+
+static NTSTATUS enter_attach_dispatch(void)
+{
+    NTSTATUS status;
+    struct _KTHREAD *thread;
+
+    if (!TryEnterCriticalSection( &attach_dispatch_cs )) return STATUS_DEVICE_BUSY;
+    if (attach_context.tid)
+    {
+        LeaveCriticalSection( &attach_dispatch_cs );
+        return STATUS_NOT_SUPPORTED;
+    }
+    thread = KeGetCurrentThread();
+    if (!thread || !thread->process)
+    {
+        LeaveCriticalSection( &attach_dispatch_cs );
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    attach_context.thread = thread;
+    attach_context.caller = attach_context.process = thread->process;
+    ObReferenceObject( attach_context.process );
+    if ((status = acquire_attach_views( attach_context.process )))
+    {
+        ObDereferenceObject( attach_context.process );
+        memset( &attach_context, 0, sizeof(attach_context) );
+        LeaveCriticalSection( &attach_dispatch_cs );
+        return status;
+    }
+    attach_context.tid = GetCurrentThreadId();
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS leave_attach_dispatch(void)
+{
+    unsigned int i;
+    NTSTATUS status = attach_context.depth ? STATUS_INVALID_DEVICE_STATE : STATUS_SUCCESS;
+
+    release_attach_views();
+    attach_context.thread->process = attach_context.caller;
+    ObDereferenceObject( attach_context.process );
+    for (i = 0; i < attach_context.depth; ++i)
+        ObDereferenceObject( attach_context.frames[i].process );
+    /* Do not touch escaped KAPC_STATE pointers after an exception unwinds the
+     * driver's frames.  Their private references are owned by this context. */
+    memset( &attach_context, 0, sizeof(attach_context) );
+    LeaveCriticalSection( &attach_dispatch_cs );
+    return status;
+}
+
+static void park_dispatch_failure( IRP *irp, struct irp_data *data, NTSTATUS status )
+{
+    irp->IoStatus.Status = status;
+    irp->IoStatus.Information = 0;
+    if (data->complete) return;
+    /* Before IoCallDriver the completion stack has not been entered. Calling
+     * IoCompleteRequest here would bypass our parking routine and free the
+     * shared IRP. The coordinator retains the sole final completion ownership. */
+    if (irp->CurrentLocation > irp->StackCount) data->complete = TRUE;
+    else IoCompleteRequest( irp, IO_NO_INCREMENT );
+}
+
+static NTSTATUS call_attached_driver( DEVICE_OBJECT *device, IRP *irp, struct irp_data *irp_data )
+{
+    NTSTATUS status, cleanup;
+    BOOL fault = FALSE;
+
+    if ((status = enter_attach_dispatch())) goto complete;
+    __TRY
+    {
+        status = IoCallDriver( device, irp );
+    }
+    __EXCEPT_ALL
+    {
+        status = GetExceptionCode();
+        fault = TRUE;
+    }
+    __ENDTRY
+    cleanup = leave_attach_dispatch();
+    if (status == STATUS_PENDING || (!fault && !irp_data->complete))
+        attach_experiment_fatal( "asynchronous driver dispatch", STATUS_NOT_SUPPORTED );
+    if (!fault && !cleanup) return status;
+    if (!fault) status = cleanup;
+complete:
+    park_dispatch_failure( irp, irp_data, status );
+    return status;
+}
+
+/* Convert the owner's initialized image writable sections to a common backing
+ * before the one DriverEntry. Worker imports are resolved privately and checked
+ * against this canonical IAT before the backing is adopted. */
+static NTSTATUS collect_executor_dependencies( struct executor_image *image, HMODULE module )
+{
+    const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( module );
+    const IMAGE_IMPORT_DESCRIPTOR *imports;
+    struct executor_module *record;
+    HMODULE provider;
+    unsigned int index, i;
+    NTSTATUS status;
+
+    if (module == image->base) return STATUS_SUCCESS;
+    for (i = 0; i < image->dependency_count; ++i)
+        if (image->dependencies[i].base == module) return STATUS_SUCCESS;
+    if (image->dependency_count == EXECUTOR_DEPENDENCIES || !nt) return STATUS_NOT_SUPPORTED;
+    index = image->dependency_count++;
+    record = &image->dependencies[index];
+    record->base = module;
+    record->size = nt->OptionalHeader.SizeOfImage;
+    if (!GetModuleFileNameW( module, record->path, ARRAY_SIZE(record->path) )) return STATUS_DLL_NOT_FOUND;
+    imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress ?
+        (void *)((char *)module + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress) : NULL;
+    while (imports && imports->Name)
+    {
+        const ULONG_PTR *thunk = (void *)((char *)module + imports->FirstThunk);
+        for (; *thunk; ++thunk)
+        {
+            if (record->import_count == EXECUTOR_IMPORTS) return STATUS_NOT_SUPPORTED;
+            record->imports[record->import_count].rva = (const char *)thunk - (const char *)module;
+            record->imports[record->import_count++].value = *thunk;
+            if (!GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    (const WCHAR *)*thunk, &provider )) return STATUS_NOT_SUPPORTED;
+            if ((status = collect_executor_dependencies( image, provider ))) return status;
+        }
+        ++imports;
+    }
+    /* Dependencies precede dependents; cycles through already mapped runtime
+     * modules are validated by the load-at-address and IAT guards below. */
+    image->dependency_order[image->order_count++] = index;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS prepare_executor_image( HMODULE module )
+{
+    const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( module );
+    const IMAGE_SECTION_HEADER *sections;
+    const IMAGE_IMPORT_DESCRIPTOR *imports;
+    struct executor_image *image;
+    LARGE_INTEGER size;
+    void *view = NULL;
+    SIZE_T view_size;
+    NTSTATUS status;
+    HMODULE provider;
+    unsigned int i;
+
+    if (executor_image_count == EXECUTOR_IMAGES || !nt || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size ||
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size)
+        return STATUS_NOT_SUPPORTED;
+    if (!(image = alloc_kernel_buffer( sizeof(*image), TRUE ))) return STATUS_NO_MEMORY;
+    image->base = module;
+    image->size = nt->OptionalHeader.SizeOfImage;
+    if (!GetModuleFileNameW( module, image->path, ARRAY_SIZE(image->path) ))
+    {
+        status = STATUS_DLL_NOT_FOUND;
+        goto failed;
+    }
+    sections = IMAGE_FIRST_SECTION( nt );
+    imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress ?
+        (void *)((char *)module + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress) : NULL;
+    while (imports && imports->Name)
+    {
+        const ULONG_PTR *thunk = (void *)((char *)module + imports->FirstThunk);
+        for (; *thunk; ++thunk)
+        {
+            if (image->import_count == EXECUTOR_IMPORTS) { status = STATUS_NOT_SUPPORTED; goto failed; }
+            image->imports[image->import_count].rva = (const char *)thunk - (const char *)module;
+            image->imports[image->import_count++].value = *thunk;
+            if (!GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    (const WCHAR *)*thunk, &provider )) { status = STATUS_NOT_SUPPORTED; goto failed; }
+            if ((status = collect_executor_dependencies( image, provider ))) goto failed;
+        }
+        ++imports;
+    }
+    size.QuadPart = image->size;
+    status = NtCreateSection( &image->section, SECTION_ALL_ACCESS, NULL, &size, PAGE_READWRITE, SEC_COMMIT, NULL );
+    if (status) goto failed;
+    view_size = image->size;
+    status = NtMapViewOfSection( image->section, NtCurrentProcess(), &view, 0, 0, NULL,
+            &view_size, ViewUnmap, 0, PAGE_READWRITE );
+    if (status) goto failed;
+    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        SIZE_T section_size = max( sections[i].Misc.VirtualSize, sections[i].SizeOfRawData );
+        section_size = (section_size + PAGE_SIZE - 1) & ~(SIZE_T)(PAGE_SIZE - 1);
+        if (!(sections[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+        if ((sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
+            (sections[i].VirtualAddress & (PAGE_SIZE - 1)) ||
+            section_size > image->size || sections[i].VirtualAddress > image->size - section_size)
+        {
+            status = STATUS_NOT_SUPPORTED;
+            goto failed;
+        }
+        memcpy( (char *)view + sections[i].VirtualAddress,
+                (char *)module + sections[i].VirtualAddress, section_size );
+    }
+    NtUnmapViewOfSection( NtCurrentProcess(), view );
+    view = NULL;
+    if ((status = __wine_map_shared_driver_image( module, image->section )))
+        attach_experiment_fatal( "owner driver image overlay", status );
+    executor_images[executor_image_count++] = image;
+    TRACE( "concurrent driver image %s base %p imports %u backing %p\n",
+            debugstr_w(image->path), module, image->import_count, image->section );
+    return STATUS_SUCCESS;
+failed:
+    if (view) NtUnmapViewOfSection( NtCurrentProcess(), view );
+    if (image->section) NtClose( image->section );
+    free_kernel_buffer( image );
+    return status;
+}
+
+static NTSTATUS map_executor_image( struct executor_slot *slot )
+{
+    static struct executor_image *mapped[EXECUTOR_IMAGES];
+    static unsigned int count;
+    struct executor_image *image = slot->image;
+    HMODULE module;
+    unsigned int i, j;
+    NTSTATUS status;
+
+    for (i = 0; i < count; ++i) if (mapped[i] == image) { NtClose( slot->image_section ); return STATUS_SUCCESS; }
+    if (count == EXECUTOR_IMAGES) return STATUS_NOT_SUPPORTED;
+    for (i = 0; i < image->order_count; ++i)
+    {
+        const struct executor_module *dependency = &image->dependencies[image->dependency_order[i]];
+        status = __wine_load_driver_at( dependency->path, dependency->base, dependency->size, &module );
+        if (status)
+        {
+            ERR( "worker dependency %s canonical load failed %#lx at %p\n",
+                    debugstr_w(dependency->path), status, dependency->base );
+            return status;
+        }
+    }
+    for (i = 0; i < image->dependency_count; ++i)
+    {
+        const struct executor_module *dependency = &image->dependencies[i];
+        for (j = 0; j < dependency->import_count; ++j)
+            if (*(ULONG_PTR *)((char *)dependency->base + dependency->imports[j].rva) != dependency->imports[j].value)
+            {
+                ERR( "worker dependency %s canonical IAT mismatch rva %#lx\n",
+                        debugstr_w(dependency->path), dependency->imports[j].rva );
+                return STATUS_CONFLICTING_ADDRESSES;
+            }
+    }
+    status = __wine_load_driver_at( image->path, image->base, image->size, &module );
+    if (status) return status;
+    if (module != image->base || RtlImageNtHeader( module )->OptionalHeader.SizeOfImage != image->size)
+    {
+        ERR( "worker image %s canonical address mismatch %p != %p\n", debugstr_w(image->path), module, image->base );
+        return STATUS_CONFLICTING_ADDRESSES;
+    }
+    for (i = 0; i < image->import_count; ++i)
+        if (*(ULONG_PTR *)((char *)module + image->imports[i].rva) != image->imports[i].value)
+        {
+            ERR( "worker canonical IAT mismatch rva %#lx %Ix != %Ix\n", image->imports[i].rva,
+                    *(ULONG_PTR *)((char *)module + image->imports[i].rva), image->imports[i].value );
+            return STATUS_CONFLICTING_ADDRESSES;
+        }
+    status = __wine_map_shared_driver_image( module, slot->image_section );
+    NtClose( slot->image_section );
+    slot->image_section = NULL;
+    if (status) attach_experiment_fatal( "worker driver image overlay", status );
+    mapped[count++] = image;
+    return STATUS_SUCCESS;
+}
+
+#ifdef __x86_64__
+struct executor_stack_bridge
+{
+    CONTEXT native;
+    struct executor_slot *slot;
+    void *stack_base, *stack_limit, *deallocation_stack;
+    EXCEPTION_REGISTRATION_RECORD *exception_list;
+    volatile LONG resumed;
+    volatile NTSTATUS status;
+};
+
+static void DECLSPEC_NORETURN executor_stack_return_trap(void)
+{
+    attach_experiment_fatal( "dispatch stack escaped its C root", STATUS_INVALID_DEVICE_STATE );
+    for (;;) ;
+}
+
+/* This is an ordinary compiled C frame with normal unwind metadata. Only the
+ * scheduler's native frame is paused; driver frames are created and unwound
+ * entirely on the worker's distinct common kernel stack. */
+static void WINAPI executor_dispatch_entry( struct executor_stack_bridge *bridge )
+{
+    TEB *teb = NtCurrentTeb();
+    NTSTATUS status;
+
+    __TRY
+    {
+        KeEnterCriticalRegion();
+        bridge->status = call_attached_driver( bridge->slot->device, bridge->slot->irp, bridge->slot->irp_data );
+        KeLeaveCriticalRegion();
+        if (attach_context.tid)
+            attach_experiment_fatal( "dispatch stack attachment cleanup", STATUS_INVALID_DEVICE_STATE );
+    }
+    __EXCEPT_ALL
+    {
+        /* Unexpected scheduler/root faults cannot be advertised as a clean
+         * dispatch. Existing driver exceptions are caught and cleaned by
+         * call_attached_driver before returning here. */
+        attach_experiment_fatal( "dispatch stack root exception", GetExceptionCode() );
+    }
+    __ENDTRY
+    teb->Tib.StackBase = bridge->stack_base;
+    teb->Tib.StackLimit = bridge->stack_limit;
+    teb->DeallocationStack = bridge->deallocation_stack;
+    teb->Tib.ExceptionList = bridge->exception_list;
+    InterlockedExchange( &bridge->resumed, 1 );
+    status = NtContinue( &bridge->native, FALSE );
+    attach_experiment_fatal( "restore native scheduler context", status );
+}
+
+static NTSTATUS call_executor_on_kernel_stack( struct executor_slot *slot )
+{
+    struct executor_stack_bridge bridge = {0};
+    CONTEXT dispatch;
+    TEB *teb = NtCurrentTeb();
+    void *top = (char *)slot->dispatch_stack + PAGE_SIZE + EXECUTOR_STACK_SIZE;
+    NTSTATUS status;
+
+    bridge.slot = slot;
+    bridge.stack_base = teb->Tib.StackBase;
+    bridge.stack_limit = teb->Tib.StackLimit;
+    bridge.deallocation_stack = teb->DeallocationStack;
+    bridge.exception_list = teb->Tib.ExceptionList;
+    RtlCaptureContext( &bridge.native );
+    if (InterlockedCompareExchange( &bridge.resumed, 0, 0 )) return bridge.status;
+    dispatch = bridge.native;
+    dispatch.Rip = (ULONG_PTR)executor_dispatch_entry;
+    dispatch.Rsp = (ULONG_PTR)top - 0x28;
+    dispatch.Rcx = (ULONG_PTR)&bridge;
+    *(ULONG_PTR *)(ULONG_PTR)dispatch.Rsp = (ULONG_PTR)executor_stack_return_trap;
+    teb->Tib.StackBase = top;
+    teb->Tib.StackLimit = (char *)slot->dispatch_stack + PAGE_SIZE;
+    teb->DeallocationStack = slot->dispatch_stack;
+    teb->Tib.ExceptionList = (EXCEPTION_REGISTRATION_RECORD *)~(ULONG_PTR)0;
+    status = NtContinue( &dispatch, FALSE );
+    teb->Tib.StackBase = bridge.stack_base;
+    teb->Tib.StackLimit = bridge.stack_limit;
+    teb->DeallocationStack = bridge.deallocation_stack;
+    teb->Tib.ExceptionList = bridge.exception_list;
+    attach_experiment_fatal( "enter common kernel dispatch stack", status );
+    return status;
+}
+#endif
+
+/* Internal winedevice entry. This process never registers a second service,
+ * initializes a second driver instance, or consumes the manager request queue. */
+NTSTATUS CDECL wine_ntoskrnl_executor_worker( HANDLE section, void *base, SIZE_T size, void *arg )
+{
+    struct executor_slot *slot = arg;
+    NTSTATUS status;
+    DWORD ret;
+    void *guard;
+    SIZE_T guard_size;
+    ULONG old_protect;
+
+    if (!concurrent_driver_enabled()) return STATUS_NOT_SUPPORTED;
+    if ((status = kernel_memory_adopt( section, base, size ))) return status;
+    if ((ULONG_PTR)slot < (ULONG_PTR)base || (ULONG_PTR)slot > (ULONG_PTR)base + size - sizeof(*slot))
+        return STATUS_INVALID_PARAMETER;
+    executor_worker_process = TRUE;
+    executor_manager = slot->manager;
+    executor_registry_mutex = slot->registry_mutex;
+    PsInitialSystemProcess = slot->system_process;
+    if ((status = initialize_attach_experiment()) || !attach_enabled) return status ? status : STATUS_NOT_SUPPORTED;
+    if ((ULONG_PTR)slot->dispatch_stack < (ULONG_PTR)base ||
+        (ULONG_PTR)slot->dispatch_stack > (ULONG_PTR)base + size - PAGE_SIZE - EXECUTOR_STACK_SIZE ||
+        ((ULONG_PTR)slot->dispatch_stack & (PAGE_SIZE - 1))) return STATUS_INVALID_PARAMETER;
+    guard = slot->dispatch_stack;
+    guard_size = PAGE_SIZE;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &guard, &guard_size, PAGE_NOACCESS, &old_protect );
+    if (status || guard != slot->dispatch_stack || guard_size != PAGE_SIZE)
+        return status ? status : STATUS_CONFLICTING_ADDRESSES;
+    SetEvent( slot->ready_event );
+    for (;;)
+    {
+        ret = WaitForSingleObjectEx( slot->request_event, EXECUTOR_TIMEOUT, TRUE );
+        if (ret == WAIT_IO_COMPLETION) continue;
+        if (ret == WAIT_TIMEOUT) continue; /* Idle lifetime is owned by coordinator. */
+        if (ret != WAIT_OBJECT_0) return STATUS_UNSUCCESSFUL;
+        if (InterlockedCompareExchange( &slot->state, EXECUTOR_RUNNING, EXECUTOR_REQUEST ) != EXECUTOR_REQUEST)
+        {
+            if (slot->state == EXECUTOR_STOP)
+            {
+                guard = slot->dispatch_stack;
+                guard_size = PAGE_SIZE;
+                return NtProtectVirtualMemory( NtCurrentProcess(), &guard, &guard_size, PAGE_READWRITE, &old_protect );
+            }
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+        NtCurrentTeb()->Instrumentation[1] = slot->thread;
+        status = map_executor_image( slot );
+        if (!status)
+        {
+#ifdef __x86_64__
+            status = call_executor_on_kernel_stack( slot );
+#else
+            status = STATUS_NOT_SUPPORTED;
+            park_dispatch_failure( slot->irp, slot->irp_data, status );
+#endif
+        }
+        else
+        {
+            if (slot->image_section) NtClose( slot->image_section );
+            slot->image_section = NULL;
+            park_dispatch_failure( slot->irp, slot->irp_data, status );
+        }
+        NtCurrentTeb()->Instrumentation[1] = NULL;
+        slot->status = status;
+        /* Completion remains parked until both dispatch and attachment cleanup
+         * have returned. The owner retains/frees the shared IRP and buffers. */
+        InterlockedExchange( &slot->state, EXECUTOR_DONE );
+        SetEvent( slot->done_event );
+    }
+}
+
+static NTSTATUS start_executor_workers(void)
+{
+    SECURITY_ATTRIBUTES attributes = {sizeof(attributes), NULL, TRUE};
+    PROCESS_INFORMATION process;
+    STARTUPINFOW startup = {sizeof(startup)};
+    WCHAR path[MAX_PATH], command[MAX_PATH + 160];
+    HANDLE section, wait[2];
+    SIZE_T size;
+    void *base;
+    NTSTATUS status;
+    unsigned int i;
+
+    if (executor_workers[0].slot) return STATUS_SUCCESS;
+    if ((status = kernel_memory_export( &section, &base, &size ))) return status;
+    lock_executor_registry();
+    unlock_executor_registry();
+    if (!SetHandleInformation( section, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT ) ||
+        !SetHandleInformation( get_device_manager(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT ) ||
+        !GetModuleFileNameW( NULL, path, ARRAY_SIZE(path) )) return STATUS_INVALID_HANDLE;
+    for (i = 0; i < EXECUTOR_COUNT; ++i)
+    {
+        struct executor_worker *worker = &executor_workers[i];
+        struct executor_slot *slot = alloc_kernel_buffer( sizeof(*slot), TRUE );
+        if (!slot) return STATUS_NO_MEMORY;
+        worker->slot = slot;
+        slot->dispatch_stack = alloc_kernel_buffer( PAGE_SIZE + EXECUTOR_STACK_SIZE, TRUE );
+        if (!slot->dispatch_stack) return STATUS_NO_MEMORY;
+        slot->request_event = CreateEventW( &attributes, FALSE, FALSE, NULL );
+        slot->done_event = CreateEventW( &attributes, TRUE, FALSE, NULL );
+        slot->ready_event = CreateEventW( &attributes, TRUE, FALSE, NULL );
+        slot->manager = get_device_manager();
+        slot->registry_mutex = executor_registry_mutex;
+        slot->system_process = PsInitialSystemProcess;
+        if (!slot->request_event || !slot->done_event || !slot->ready_event) return STATUS_NO_MEMORY;
+        swprintf( command, ARRAY_SIZE(command), L"\"%s\" --wine-driver-executor %Ix %Ix %Ix %Ix",
+                path, (ULONG_PTR)section, (ULONG_PTR)base, size, (ULONG_PTR)slot );
+        if (!CreateProcessW( path, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process ))
+            return STATUS_DLL_INIT_FAILED;
+        worker->process = process.hProcess;
+        CloseHandle( process.hThread );
+        wait[0] = slot->ready_event;
+        wait[1] = worker->process;
+        if (WaitForMultipleObjects( 2, wait, FALSE, EXECUTOR_TIMEOUT ) != WAIT_OBJECT_0)
+            return STATUS_IO_TIMEOUT;
+        TRACE( "concurrent executor %u physical PID %#lx shared arena %p slot %p\n",
+                i, process.dwProcessId, base, slot );
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS queue_executor_irp( DEVICE_OBJECT *device, IRP *irp, struct irp_data *data )
+{
+    struct executor_worker *worker = NULL;
+    struct executor_image *image = NULL;
+    struct _KTHREAD *thread;
+    NTSTATUS status;
+    unsigned int i;
+
+    EnterCriticalSection( &executor_lifecycle_cs );
+    if (!attach_enabled) { status = STATUS_NOT_SUPPORTED; goto failed; }
+    drain_executor_completions();
+    if ((status = start_executor_workers())) { stop_executor_workers(); goto failed; }
+    for (i = 0; i < executor_image_count; ++i)
+        if (executor_images[i]->base == device->DriverObject->DriverStart) { image = executor_images[i]; break; }
+    if (!image) { status = STATUS_NOT_SUPPORTED; goto failed; }
+    thread = KeGetCurrentThread();
+    if (!thread || !thread->process) { status = STATUS_INVALID_DEVICE_STATE; goto failed; }
+    /* Attachment changes this logical KTHREAD's current process. A second
+     * outstanding request borrowing the same thread would race that state,
+     * even in another physical executor. Distinct caller threads remain
+     * independent; completed slots are eligible only after owner drain. */
+    for (i = 0; i < EXECUTOR_COUNT; ++i)
+        if (executor_workers[i].slot->state != EXECUTOR_IDLE && executor_workers[i].slot->thread == thread)
+        {
+            status = STATUS_DEVICE_BUSY;
+            goto failed;
+        }
+    for (i = 0; i < EXECUTOR_COUNT; ++i)
+        if (executor_workers[i].slot->state == EXECUTOR_IDLE) { worker = &executor_workers[i]; break; }
+    if (!worker) { status = STATUS_DEVICE_BUSY; goto failed; }
+    if (!DuplicateHandle( GetCurrentProcess(), image->section, worker->process, &worker->slot->image_section,
+            0, FALSE, DUPLICATE_SAME_ACCESS )) { status = STATUS_INVALID_HANDLE; goto failed; }
+    ObReferenceObject( thread );
+    ObReferenceObject( thread->process );
+    worker->slot->thread = thread;
+    worker->slot->device = device;
+    worker->slot->irp = irp;
+    worker->slot->irp_data = data;
+    worker->slot->image = image;
+    data->executor = TRUE;
+    worker->slot->started = GetTickCount64();
+    ResetEvent( worker->slot->done_event );
+    InterlockedExchange( &worker->slot->state, EXECUTOR_REQUEST );
+    SetEvent( worker->slot->request_event );
+    TRACE( "concurrent request IRP %p logical thread %p tid %p worker slot %p\n",
+            irp, thread, thread->id.UniqueThread, worker->slot );
+    LeaveCriticalSection( &executor_lifecycle_cs );
+    return STATUS_PENDING;
+failed:
+    park_dispatch_failure( irp, data, status );
+    LeaveCriticalSection( &executor_lifecycle_cs );
+    return status;
+}
+
+static void drain_executor_completions(void)
+{
+    unsigned int i;
+    NTSTATUS status;
+    EnterCriticalSection( &executor_lifecycle_cs );
+    for (i = 0; i < EXECUTOR_COUNT; ++i)
+    {
+        struct executor_worker *worker = &executor_workers[i];
+        struct executor_slot *slot = worker->slot;
+        struct irp_data *data;
+        IRP *irp;
+        ULONG out_size;
+        if (!slot || !worker->process) continue;
+        if (slot->state != EXECUTOR_IDLE && GetTickCount64() - slot->started > EXECUTOR_TIMEOUT)
+            attach_experiment_fatal( "concurrent request deadline", STATUS_IO_TIMEOUT );
+        if (WaitForSingleObject( worker->process, 0 ) == WAIT_OBJECT_0)
+            attach_experiment_fatal( "concurrent executor process exited", STATUS_PROCESS_IS_TERMINATING );
+        if (InterlockedCompareExchange( &slot->state, EXECUTOR_DONE, EXECUTOR_DONE ) != EXECUTOR_DONE ||
+            WaitForSingleObject( slot->done_event, 0 ) != WAIT_OBJECT_0) continue;
+        data = slot->irp_data;
+        if (!data->async) continue; /* Owner has not acknowledged pending yet. */
+        irp = slot->irp;
+        out_size = get_irp_output_size( irp );
+        SERVER_START_REQ( set_irp_result )
+        {
+            req->handle = wine_server_obj_handle( data->handle );
+            req->status = irp->IoStatus.Status;
+            req->size = irp->IoStatus.Information;
+            if (out_size) wine_server_add_data( req, irp->UserBuffer, out_size );
+            status = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        if (status) attach_experiment_fatal( "concurrent result publication", status );
+        ObDereferenceObject( slot->thread->process );
+        ObDereferenceObject( slot->thread );
+        free_dispatch_irp( data );
+        IoCompleteRequest( irp, IO_NO_INCREMENT );
+        slot->irp_data = NULL;
+        slot->irp = NULL;
+        slot->thread = NULL;
+        ResetEvent( slot->done_event );
+        InterlockedExchange( &slot->state, EXECUTOR_IDLE );
+    }
+    LeaveCriticalSection( &executor_lifecycle_cs );
+}
+
+static void stop_executor_workers(void)
+{
+    unsigned int i;
+    EnterCriticalSection( &executor_lifecycle_cs );
+    for (i = 0; i < EXECUTOR_COUNT; ++i)
+    {
+        struct executor_worker *worker = &executor_workers[i];
+        struct executor_slot *slot = worker->slot;
+        if (!slot) continue;
+        if (worker->process)
+        {
+            if (slot->state != EXECUTOR_IDLE)
+            {
+                HANDLE wait[2] = {slot->done_event, worker->process};
+                if (WaitForMultipleObjects( 2, wait, FALSE, EXECUTOR_TIMEOUT ) != WAIT_OBJECT_0)
+                    attach_experiment_fatal( "executor shutdown fence", STATUS_IO_TIMEOUT );
+                drain_executor_completions();
+            }
+            InterlockedExchange( &slot->state, EXECUTOR_STOP );
+            SetEvent( slot->request_event );
+            if (WaitForSingleObject( worker->process, EXECUTOR_TIMEOUT ) != WAIT_OBJECT_0)
+                attach_experiment_fatal( "executor stop", STATUS_IO_TIMEOUT );
+            CloseHandle( worker->process );
+        }
+        if (slot->request_event) CloseHandle( slot->request_event );
+        if (slot->done_event) CloseHandle( slot->done_event );
+        if (slot->ready_event) CloseHandle( slot->ready_event );
+        free_kernel_buffer( slot->dispatch_stack );
+        free_kernel_buffer( slot );
+        memset( worker, 0, sizeof(*worker) );
+    }
+    LeaveCriticalSection( &executor_lifecycle_cs );
+}
+
 static NTSTATUS dispatch_irp( DEVICE_OBJECT *device, IRP *irp, struct dispatch_context *context )
 {
     struct irp_data *irp_data;
@@ -554,6 +1505,7 @@ static NTSTATUS dispatch_irp( DEVICE_OBJECT *device, IRP *irp, struct dispatch_c
     irp_data->irp = irp;
     irp_data->async = FALSE;
     irp_data->complete = FALSE;
+    irp_data->executor = FALSE;
 
     IoSetCompletionRoutine( irp, dispatch_irp_completion, irp_data, TRUE, TRUE, TRUE );
     context->irp_data = irp_data;
@@ -561,9 +1513,17 @@ static NTSTATUS dispatch_irp( DEVICE_OBJECT *device, IRP *irp, struct dispatch_c
 
     KeQueryTickCount( &count );  /* update the global KeTickCount */
 
+    if (concurrent_driver_enabled() && context->params.type == IRP_CALL_IOCTL &&
+        (context->params.ioctl.code & 3) == METHOD_BUFFERED)
+        return queue_executor_irp( device, irp, irp_data );
+
     device->CurrentIrp = irp;
     KeEnterCriticalRegion();
-    status = IoCallDriver( device, irp );
+    if (attach_enabled && context->params.type == IRP_CALL_IOCTL &&
+        (context->params.ioctl.code & 3) == METHOD_BUFFERED)
+        status = call_attached_driver( device, irp, irp_data );
+    else
+        status = IoCallDriver( device, irp );
     KeLeaveCriticalRegion();
     device->CurrentIrp = NULL;
 
@@ -942,6 +1902,19 @@ static void unload_driver( struct wine_rb_entry *entry, void *context )
 
     TRACE_(relay)( "\1Ret  driver unload %p (obj=%p)\n", driver->driver_obj.DriverUnload, &driver->driver_obj );
 
+    if (concurrent_driver_enabled())
+    {
+        unsigned int i;
+        stop_executor_workers();
+        for (i = 0; i < executor_image_count; ++i)
+            if (executor_images[i]->base == ldr->DllBase)
+            {
+                NtClose( executor_images[i]->section );
+                free_kernel_buffer( executor_images[i] );
+                executor_images[i] = executor_images[--executor_image_count];
+                break;
+            }
+    }
     FreeLibrary( ldr->DllBase );
     IoDeleteDriver( &driver->driver_obj );
 
@@ -949,7 +1922,6 @@ static void unload_driver( struct wine_rb_entry *entry, void *context )
     CloseServiceHandle( (void *)service_handle );
 }
 
-PEPROCESS PsInitialSystemProcess = NULL;
 
 /***********************************************************************
  *           wine_ntoskrnl_main_loop   (Not a Windows API)
@@ -960,9 +1932,11 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
     struct dispatch_context context = {.in_size = 4096};
     NTSTATUS status = STATUS_SUCCESS;
     struct wine_driver *driver;
-    HANDLE handles[2];
+    HANDLE handles[2 + EXECUTOR_COUNT * 2];
+    DWORD handle_count;
 
     if ((status = kernel_memory_init())) return status;
+    if ((status = initialize_attach_experiment())) return status;
 
     /* Set the system process global before setting up the request thread trickery  */
     PsInitialSystemProcess = IoGetCurrentProcess();
@@ -975,6 +1949,7 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
 
     for (;;)
     {
+        drain_executor_completions();
         NtCurrentTeb()->Instrumentation[1] = NULL;
         if (!context.in_buff && !(context.in_buff = alloc_kernel_buffer( context.in_size, FALSE )))
         {
@@ -997,7 +1972,7 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
                 req->user_ptr = wine_server_client_ptr( irp );
                 req->status   = status;
 
-                if (context.irp_data->complete)
+                if (context.irp_data->complete && !context.irp_data->executor)
                 {
                     /* IRP completed even before we got here; we can report completion now */
                     unsigned int out_size = get_irp_output_size( irp );
@@ -1039,7 +2014,7 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
 
         if (context.irp_data)
         {
-            if (context.irp_data->complete)
+            if (context.irp_data->complete && !context.irp_data->executor)
             {
                 IRP *irp = context.irp_data->irp;
                 free_dispatch_irp( context.irp_data );
@@ -1070,7 +2045,25 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
         case STATUS_PENDING:
             for (;;)
             {
-                DWORD ret = WaitForMultipleObjectsEx( 2, handles, FALSE, INFINITE, TRUE );
+                unsigned int i;
+                DWORD ret, timeout = INFINITE;
+                handle_count = 2;
+                for (i = 0; i < EXECUTOR_COUNT; ++i)
+                    if (executor_workers[i].slot)
+                    {
+                        handles[handle_count++] = executor_workers[i].slot->done_event;
+                        handles[handle_count++] = executor_workers[i].process;
+                        if (executor_workers[i].slot->state != EXECUTOR_IDLE) timeout = EXECUTOR_TIMEOUT;
+                    }
+                ret = WaitForMultipleObjectsEx( handle_count, handles, FALSE,
+                        timeout, TRUE );
+                if (ret >= WAIT_OBJECT_0 + 2 && ret < WAIT_OBJECT_0 + handle_count)
+                {
+                    drain_executor_completions();
+                    continue;
+                }
+                if (ret == WAIT_TIMEOUT && timeout != INFINITE)
+                    attach_experiment_fatal( "concurrent driver deadline", STATUS_IO_TIMEOUT );
                 if (ret == WAIT_OBJECT_0)
                 {
                     free_kernel_buffer( context.in_buff );
@@ -1085,6 +2078,7 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
     }
 
 done:
+    stop_executor_workers();
     free_kernel_buffer( context.in_buff );
     /* Native PnP drivers expect that all of their devices will be removed when
      * their unload routine is called. Moreover, we cannot unload a module
@@ -1547,11 +2541,44 @@ static NTSTATUS WINAPI unhandled_irp( DEVICE_OBJECT *device, IRP *irp )
 }
 
 
+static NTSTATUS share_driver_string( UNICODE_STRING *string )
+{
+    WCHAR *copy;
+    USHORT length = string->Length;
+    if (!(copy = alloc_kernel_buffer( string->Length + sizeof(WCHAR), TRUE ))) return STATUS_NO_MEMORY;
+    memcpy( copy, string->Buffer, string->Length );
+    RtlFreeUnicodeString( string );
+    string->Buffer = copy;
+    string->Length = length;
+    string->MaximumLength = string->Length + sizeof(WCHAR);
+    return STATUS_SUCCESS;
+}
+
+static void free_driver_string( UNICODE_STRING *string )
+{
+    if (concurrent_driver_enabled() && kernel_memory_free( string->Buffer )) string->Buffer = NULL;
+    else RtlFreeUnicodeString( string );
+}
+
 static void free_driver_object( void *obj )
 {
     struct wine_driver *driver = obj;
-    RtlFreeUnicodeString( &driver->driver_obj.DriverName );
-    RtlFreeUnicodeString( &driver->driver_obj.DriverExtension->ServiceKeyName );
+    free_driver_string( &driver->driver_obj.DriverName );
+    free_driver_string( &driver->driver_obj.DriverExtension->ServiceKeyName );
+    if (concurrent_driver_enabled() && driver->driver_obj.DriverSection)
+    {
+        LDR_DATA_TABLE_ENTRY *entry = driver->driver_obj.DriverSection;
+        unsigned int i;
+        for (i = 0; i < executor_image_count; ++i)
+            if (executor_images[i]->base == entry->DllBase)
+            {
+                NtClose( executor_images[i]->section );
+                free_kernel_buffer( executor_images[i] );
+                executor_images[i] = executor_images[--executor_image_count];
+                break;
+            }
+        kernel_memory_free( entry );
+    }
     free_kernel_object( driver );
 }
 
@@ -1594,6 +2621,13 @@ NTSTATUS WINAPI IoCreateDriver( UNICODE_STRING *name, PDRIVER_INITIALIZE init )
     driver->driver_obj.DriverExtension = &driver->driver_extension;
     driver->driver_extension.DriverObject   = &driver->driver_obj;
     build_driver_keypath( driver->driver_obj.DriverName.Buffer, &driver->driver_extension.ServiceKeyName );
+    if (concurrent_driver_enabled() &&
+        ((status = share_driver_string( &driver->driver_obj.DriverName )) ||
+         (status = share_driver_string( &driver->driver_extension.ServiceKeyName ))))
+    {
+        free_driver_object( driver );
+        return status;
+    }
     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
         driver->driver_obj.MajorFunction[i] = unhandled_irp;
     list_init( &driver->root_pnp_devices );
@@ -4138,7 +5172,22 @@ static NTSTATUS WINAPI init_driver( DRIVER_OBJECT *driver_object, UNICODE_STRING
     if (!module)
         return STATUS_DLL_INIT_FAILED;
 
+    if (concurrent_driver_enabled() && (status = prepare_executor_image( module )))
+        return status;
+
     driver_object->DriverSection = find_ldr_module( module );
+    if (concurrent_driver_enabled())
+    {
+        LDR_DATA_TABLE_ENTRY *entry = driver_object->DriverSection;
+        LDR_DATA_TABLE_ENTRY *shared = alloc_kernel_buffer( sizeof(*shared), TRUE );
+        if (!shared) return STATUS_NO_MEMORY;
+        shared->DllBase = entry->DllBase;
+        shared->EntryPoint = entry->EntryPoint;
+        shared->SizeOfImage = entry->SizeOfImage;
+        /* Loader bookkeeping remains private. Only public descriptor fields
+         * are supported in the bounded executor image closure. */
+        driver_object->DriverSection = shared;
+    }
     driver_object->DriverStart = ((LDR_DATA_TABLE_ENTRY *)driver_object->DriverSection)->DllBase;
     driver_object->DriverSize = ((LDR_DATA_TABLE_ENTRY *)driver_object->DriverSection)->SizeOfImage;
 
@@ -4266,7 +5315,20 @@ NTSTATUS WINAPI ZwUnloadDriver( const UNICODE_STRING *service_name )
         return STATUS_UNSUCCESSFUL;
     }
 
-    unload_driver( entry, NULL );
+    if (concurrent_driver_enabled())
+    {
+        unsigned int i;
+        EnterCriticalSection( &executor_lifecycle_cs );
+        for (i = 0; i < EXECUTOR_COUNT; ++i)
+            if (executor_workers[i].slot && executor_workers[i].slot->state != EXECUTOR_IDLE)
+            {
+                LeaveCriticalSection( &executor_lifecycle_cs );
+                return STATUS_DEVICE_BUSY;
+            }
+        unload_driver( entry, NULL );
+        LeaveCriticalSection( &executor_lifecycle_cs );
+    }
+    else unload_driver( entry, NULL );
 
     return STATUS_SUCCESS;
 }
@@ -4705,12 +5767,69 @@ void * WINAPI PsGetProcessSectionBaseAddress(PEPROCESS process)
 
 void WINAPI KeStackAttachProcess(KPROCESS *process, KAPC_STATE *apc_state)
 {
-    FIXME("process %p, apc_state %p stub.\n", process, apc_state);
+    struct attach_frame *frame;
+    PEPROCESS target = (PEPROCESS)process;
+    NTSTATUS status;
+    unsigned int i;
+
+    if (!attach_enabled)
+    {
+        FIXME("process %p, apc_state %p stub.\n", process, apc_state);
+        return;
+    }
+    if (!attach_context.tid || attach_context.tid != GetCurrentThreadId() ||
+        attach_context.thread != KeGetCurrentThread()) RtlRaiseStatus( STATUS_NOT_SUPPORTED );
+    if (!process || !apc_state || ObGetObjectType( target ) != PsProcessType)
+        RtlRaiseStatus( STATUS_INVALID_PARAMETER );
+    if (attach_context.depth == ATTACH_MAX_DEPTH) RtlRaiseStatus( STATUS_STACK_OVERFLOW );
+    for (i = 0; i < attach_context.depth; ++i)
+        if (attach_context.frames[i].state == apc_state) RtlRaiseStatus( STATUS_INVALID_PARAMETER );
+
+    ObReferenceObject( target );
+    if ((status = switch_attach_views( target )))
+    {
+        ObDereferenceObject( target );
+        RtlRaiseStatus( status );
+    }
+    frame = &attach_context.frames[attach_context.depth++];
+    frame->state = apc_state;
+    frame->process = attach_context.process;
+    attach_context.process = target;
+    attach_context.thread->process = target;
+    /* Transfer reference ownership before touching caller storage so an
+     * exceptional invalid state pointer is still cleaned up by dispatch. */
+    memset( apc_state, 0, sizeof(*apc_state) );
+    InitializeListHead( &apc_state->ApcListHead[0] );
+    InitializeListHead( &apc_state->ApcListHead[1] );
+    apc_state->Process = (KPROCESS *)frame->process;
+    TRACE( "experimental attach depth %u process %p logical thread %p\n",
+           attach_context.depth, target, attach_context.thread );
 }
 
 void WINAPI KeUnstackDetachProcess(KAPC_STATE *apc_state)
 {
-    FIXME("apc_state %p stub.\n", apc_state);
+    struct attach_frame *frame;
+    NTSTATUS status;
+
+    if (!attach_enabled)
+    {
+        FIXME("apc_state %p stub.\n", apc_state);
+        return;
+    }
+    if (!attach_context.tid || attach_context.tid != GetCurrentThreadId() ||
+        attach_context.thread != KeGetCurrentThread()) RtlRaiseStatus( STATUS_NOT_SUPPORTED );
+    if (!attach_context.depth) RtlRaiseStatus( STATUS_INVALID_DEVICE_STATE );
+    frame = &attach_context.frames[attach_context.depth - 1];
+    if (!apc_state || frame->state != apc_state || apc_state->Process != (KPROCESS *)frame->process)
+        RtlRaiseStatus( STATUS_INVALID_PARAMETER );
+    if ((status = switch_attach_views( frame->process ))) RtlRaiseStatus( status );
+    ObDereferenceObject( attach_context.process );
+    attach_context.process = frame->process;
+    attach_context.thread->process = frame->process;
+    --attach_context.depth;
+    memset( frame, 0, sizeof(*frame) );
+    TRACE( "experimental detach depth %u process %p logical thread %p\n",
+           attach_context.depth, attach_context.process, attach_context.thread );
 }
 
 NTSTATUS WINAPI KdDisableDebugger(void)

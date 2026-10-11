@@ -78,6 +78,10 @@ NTSTATUS kernel_memory_init(void);
 BOOL kernel_memory_enabled(void);
 void *kernel_memory_alloc( SIZE_T size, SIZE_T alignment, BOOL executable, BOOL zero, ULONG tag );
 BOOL kernel_memory_free( void *ptr );
+NTSTATUS kernel_memory_export( HANDLE *section, void **base, SIZE_T *size );
+NTSTATUS kernel_memory_adopt( HANDLE section, void *base, SIZE_T size );
+NTSTATUS WINAPI __wine_map_shared_driver_image( void *image, HANDLE section );
+NTSTATUS WINAPI __wine_load_driver_at( const WCHAR *path, void *base, SIZE_T size, HMODULE *module );
 
 extern POBJECT_TYPE ExEventObjectType;
 extern POBJECT_TYPE ExSemaphoreObjectType;

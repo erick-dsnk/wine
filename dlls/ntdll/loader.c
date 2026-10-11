@@ -2942,12 +2942,29 @@ static WINE_MODREF *find_existing_module( HMODULE module )
  */
 static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_name, HANDLE mapping,
                                  const SECTION_IMAGE_INFORMATION *image_info, const struct file_id *id,
-                                 DWORD flags, BOOL system, BOOL redirected, WINE_MODREF** pwm )
+                                 DWORD flags, BOOL system, BOOL redirected, WINE_MODREF** pwm,
+                                 void *canonical_base, SIZE_T canonical_size )
 {
     void *module = NULL;
     SIZE_T len = 0;
-    NTSTATUS status = NtMapViewOfSection( mapping, NtCurrentProcess(), &module, 0, 0, NULL, &len,
-                                          ViewShare, 0, PAGE_EXECUTE_READ );
+    NTSTATUS status;
+
+    if (canonical_base)
+    {
+        MEM_ADDRESS_REQUIREMENTS bounds = {canonical_base, (char *)canonical_base + canonical_size - 1, 0};
+        MEM_EXTENDED_PARAMETER parameter = {0};
+        parameter.Type = MemExtendedParameterAddressRequirements;
+        parameter.Pointer = &bounds;
+        status = NtMapViewOfSectionEx( mapping, NtCurrentProcess(), &module, NULL, &len,
+                                      0, PAGE_EXECUTE_READ, &parameter, 1 );
+        if (NT_SUCCESS(status) && (module != canonical_base || len != canonical_size))
+        {
+            NtUnmapViewOfSection( NtCurrentProcess(), module );
+            return STATUS_CONFLICTING_ADDRESSES;
+        }
+    }
+    else status = NtMapViewOfSection( mapping, NtCurrentProcess(), &module, 0, 0, NULL, &len,
+                                     ViewShare, 0, PAGE_EXECUTE_READ );
 
     if (!NT_SUCCESS(status)) return status;
 
@@ -3549,7 +3566,7 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
 
     case STATUS_SUCCESS:  /* valid PE file */
         nts = load_native_dll( load_path, &nt_name, mapping, &image_info, &id, flags, system,
-                               redirected, pwm );
+                               redirected, pwm, NULL, 0 );
         break;
     }
 
@@ -3607,6 +3624,57 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
     struct wine_spawnvp_params params = { (char **)argv, wait };
 
     return WINE_UNIX_CALL( unix_wine_spawnvp, &params );
+}
+
+/* Map driver writable data through an inherited shared SEC_COMMIT section. */
+NTSTATUS WINAPI __wine_map_shared_driver_image( void *image, HANDLE section )
+{
+    struct wine_map_shared_driver_image_params params = { image, section };
+
+    return WINE_UNIX_CALL( unix_map_shared_driver_image, &params );
+}
+
+/* The experimental executor requires the owner's root image address. Use the
+ * normal PE loader, relocations and import resolution with a bounded image
+ * mapping; dependency addresses remain subject to the executor's IAT checks. */
+NTSTATUS WINAPI __wine_load_driver_at( const WCHAR *name, void *base, SIZE_T size, HMODULE *module )
+{
+    SECTION_IMAGE_INFORMATION image_info;
+    UNICODE_STRING nt_name = {0};
+    struct file_id id;
+    WINE_MODREF *wm = NULL;
+    HANDLE mapping = NULL;
+    WCHAR *path = NULL, *dummy;
+    BOOL redirected;
+    NTSTATUS status;
+
+    *module = NULL;
+    if (!base || ((ULONG_PTR)base & 0xffff) || !size || (size & (page_size - 1)) ||
+        (ULONG_PTR)base + size < (ULONG_PTR)base) return STATUS_INVALID_PARAMETER;
+    status = LdrGetDllPath( name, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                            &path, &dummy );
+    if (status) return status;
+    RtlEnterCriticalSection( &loader_section );
+    status = find_dll_file( path, name, &nt_name, &wm, &mapping, &image_info, &id, &redirected, FALSE );
+    if (!status && wm)
+    {
+        if (wm->ldr.DllBase != base || wm->ldr.SizeOfImage != size) status = STATUS_CONFLICTING_ADDRESSES;
+        else if (wm->ldr.LoadCount != -1) ++wm->ldr.LoadCount;
+    }
+    else if (!status)
+        status = load_native_dll( path, &nt_name, mapping, &image_info, &id, 0, FALSE,
+                                  redirected, &wm, base, size );
+    if (!status)
+    {
+        status = process_attach( wm->ldr.DdagNode, NULL );
+        if (status) LdrUnloadDll( wm->ldr.DllBase );
+        else *module = wm->ldr.DllBase;
+    }
+    if (mapping) NtClose( mapping );
+    RtlFreeUnicodeString( &nt_name );
+    RtlLeaveCriticalSection( &loader_section );
+    RtlReleasePath( path );
+    return status;
 }
 
 

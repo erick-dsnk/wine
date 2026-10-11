@@ -1765,6 +1765,19 @@ DECL_HANDLER(lookup_private_mapping)
     set_error( STATUS_NOT_FOUND );
 }
 
+static int private_mapping_lease_conflicts( struct private_mapping *mapping, unsigned int access )
+{
+    struct private_mapping_lease *lease;
+
+    LIST_FOR_EACH_ENTRY( lease, &mapping->leases, struct private_mapping_lease, entry )
+        /* One consumer cannot overlay the same address twice. Writers remain
+         * exclusive, including while their view is awaiting revocation. Read
+         * views in independent address spaces share the unchanged backing. */
+        if (lease->consumer == current->process || (access & FILE_WRITE_DATA) ||
+            (lease->access & FILE_WRITE_DATA)) return 1;
+    return 0;
+}
+
 DECL_HANDLER(acquire_private_mapping)
 {
     struct process *process;
@@ -1790,7 +1803,8 @@ DECL_HANDLER(acquire_private_mapping)
             if (!mapping->retired && !(mapping->pages[0] & 0x80) && mapping->owner == process &&
                 mapping->base == req->address) break;
         if (&mapping->entry == &private_mappings) set_error( STATUS_NOT_FOUND );
-        else if (mapping->pending_operation || !list_empty( &mapping->leases )) set_error( STATUS_DEVICE_BUSY );
+        else if (mapping->pending_operation || private_mapping_lease_conflicts( mapping, req->access ))
+            set_error( STATUS_DEVICE_BUSY );
         else if (mapping->mapping->size != req->size) set_error( STATUS_NOT_SUPPORTED );
         else
         {

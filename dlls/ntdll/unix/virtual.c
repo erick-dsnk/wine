@@ -7630,6 +7630,158 @@ NTSTATUS WINAPI NtUnlockVirtualMemory( HANDLE process, PVOID *addr, SIZE_T *size
 
 
 /***********************************************************************
+ *             unixcall_map_shared_driver_image
+ *
+ * Overlay the writable data pages of an already loaded AMD64 driver with a
+ * shared SEC_COMMIT section. The caller initializes the section from the
+ * owner's fully loaded image before any driver entry point runs. This helper
+ * changes only the existing image view's writable, page-aligned ranges.
+ */
+NTSTATUS unixcall_map_shared_driver_image( void *args )
+{
+    struct wine_map_shared_driver_image_params *params = args;
+    struct writable_range { size_t start, size; } ranges[96];
+    IMAGE_DOS_HEADER *dos = params->image;
+    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_SECTION_HEADER *section;
+    struct file_view *view;
+    SECTION_BASIC_INFORMATION section_info;
+    sigset_t sigset;
+    struct stat st;
+    size_t image_size, headers_size, range_count = 0, i, j, returned, mapped_size;
+    int fd, needs_close;
+    NTSTATUS status;
+
+#ifndef _WIN64
+    return STATUS_NOT_SUPPORTED;
+#endif
+    if (!params->image || !params->section || (ULONG_PTR)params->image & page_mask)
+        return STATUS_INVALID_PARAMETER;
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    view = find_view( params->image, PAGE_SIZE );
+    if (!view || view->base != params->image || !(view->protect & SEC_IMAGE)
+            || view->purpose == MANAGED_VIEW_FOREIGN_PRIVATE)
+    {
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        return STATUS_INVALID_ADDRESS;
+    }
+    mapped_size = view->size;
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < sizeof(*dos)
+            || (ULONG_PTR)dos->e_lfanew > 0x100000
+            || (size_t)dos->e_lfanew > mapped_size - sizeof(*nt))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    nt = (IMAGE_NT_HEADERS64 *)((char *)params->image + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64
+            || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+            || nt->FileHeader.SizeOfOptionalHeader != sizeof(nt->OptionalHeader)
+            || nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_NUMBEROF_DIRECTORY_ENTRIES
+            || nt->FileHeader.NumberOfSections > ARRAY_SIZE(ranges)
+            || nt->OptionalHeader.SizeOfImage < PAGE_SIZE
+            || (nt->OptionalHeader.SizeOfImage & page_mask)
+            || nt->OptionalHeader.SizeOfHeaders > nt->OptionalHeader.SizeOfImage
+            || nt->OptionalHeader.SizeOfImage > mapped_size)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS
+            && nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress)
+        return STATUS_NOT_SUPPORTED;
+    if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT
+            && nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress)
+        return STATUS_NOT_SUPPORTED;
+
+    image_size = nt->OptionalHeader.SizeOfImage;
+    headers_size = nt->OptionalHeader.SizeOfHeaders;
+    if ((size_t)dos->e_lfanew > image_size - sizeof(*nt)
+            || (size_t)dos->e_lfanew + sizeof(*nt)
+               > image_size - nt->FileHeader.NumberOfSections * sizeof(*section)
+            || (size_t)dos->e_lfanew + sizeof(*nt)
+               + nt->FileHeader.NumberOfSections * sizeof(*section) > headers_size)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    section = IMAGE_FIRST_SECTION( nt );
+    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        size_t extent = max( section[i].Misc.VirtualSize, section[i].SizeOfRawData );
+        size_t mapped_extent;
+        size_t start = section[i].VirtualAddress;
+
+        if (!extent) continue;
+        if (start < headers_size || start > image_size || extent > image_size - start)
+            return STATUS_INVALID_IMAGE_FORMAT;
+        if (!(section[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+        if (section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            return STATUS_NOT_SUPPORTED;
+        if (start & page_mask) return STATUS_NOT_SUPPORTED;
+        mapped_extent = ROUND_SIZE( 0, extent, page_mask );
+        if (mapped_extent > image_size - start) return STATUS_INVALID_IMAGE_FORMAT;
+        for (j = 0; j < nt->FileHeader.NumberOfSections; ++j)
+        {
+            size_t other_start, other_extent, other_end;
+            if (j == i) continue;
+            other_start = section[j].VirtualAddress;
+            other_extent = max( section[j].Misc.VirtualSize, section[j].SizeOfRawData );
+            if (!other_extent) continue;
+            other_end = other_start + other_extent;
+            if ((start < ((other_end + page_mask) & ~(size_t)page_mask))
+                    && ((other_start & ~(size_t)page_mask) < start + mapped_extent))
+                return STATUS_NOT_SUPPORTED;
+        }
+        for (j = 0; j < range_count; ++j)
+            if (start < ranges[j].start + ranges[j].size && ranges[j].start < start + mapped_extent)
+                return STATUS_NOT_SUPPORTED;
+        ranges[range_count].start = start;
+        ranges[range_count].size = mapped_extent;
+        ++range_count;
+    }
+    if (!range_count) return STATUS_NOT_SUPPORTED;
+
+    if ((status = NtQuerySection( params->section, SectionBasicInformation, &section_info,
+                                  sizeof(section_info), &returned )))
+        return status;
+    if (returned < sizeof(section_info) || section_info.Size.QuadPart < 0
+            || (ULONGLONG)section_info.Size.QuadPart < image_size
+            || !(section_info.Attributes & SEC_COMMIT)
+            || (section_info.Attributes & SEC_IMAGE))
+        return STATUS_INVALID_VIEW_SIZE;
+    if ((status = server_get_unix_fd( params->section, SECTION_MAP_READ | SECTION_MAP_WRITE,
+                                      &fd, &needs_close, NULL, NULL )))
+        return status;
+    if (fstat( fd, &st ) || (ULONGLONG)st.st_size < image_size)
+    {
+        if (needs_close) close( fd );
+        return STATUS_INVALID_VIEW_SIZE;
+    }
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    view = find_view( params->image, image_size );
+    if (!view || view->base != params->image || !(view->protect & SEC_IMAGE)
+            || view->purpose == MANAGED_VIEW_FOREIGN_PRIVATE)
+    {
+        status = STATUS_INVALID_ADDRESS;
+        goto done;
+    }
+
+    for (i = 0; i < range_count; ++i)
+    {
+        unsigned int vprot = VPROT_READ | VPROT_WRITE | VPROT_COMMITTED;
+        status = map_file_into_view( view, fd, ranges[i].start, ranges[i].size,
+                                     ranges[i].start, vprot, FALSE );
+        if (status) goto done;
+        if (!set_vprot( view, (char *)params->image + ranges[i].start, ranges[i].size, vprot ))
+        {
+            status = STATUS_ACCESS_DENIED;
+            goto done;
+        }
+    }
+    status = STATUS_SUCCESS;
+
+done:
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (needs_close) close( fd );
+    return status;
+}
+
+
+/***********************************************************************
  *             NtMapViewOfSection   (NTDLL.@)
  *             ZwMapViewOfSection   (NTDLL.@)
  */
