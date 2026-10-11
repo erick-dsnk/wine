@@ -1380,12 +1380,19 @@ struct attachment_shared
 {
     ULONG_PTR common_address;
     ULONG_PTR target_address;
+    ULONG_PTR mapping_size;
+    DWORD attachment_only;
     DWORD error[2];
     HANDLE execution_mapping[3], run[2], done[2];
     ULONG_PTR execution_address[3];
     DWORD protection[2][3], collision_ok[2], observed_sequence[2], process_id[2];
     DWORD continuation_mode, continuation_accepted[2];
 };
+
+#define ATTACHMENT_RANGE_SIZE 0x10000
+#define ATTACHMENT_COMMON_BASE 0x23000000
+#define ATTACHMENT_TARGET_BASE 0x24000000
+#define ATTACHMENT_RUNTIME_RANGES "23000000:10000,24000000:10000"
 
 static BOOL map_execution_regions(struct attachment_shared *shared, void **regions, DWORD *protection)
 {
@@ -2212,25 +2219,32 @@ static void attachment_child(char **argv)
     if (shared && index < 2)
     {
         shared->process_id[index] = GetCurrentProcessId();
-        common = VirtualAlloc((void *)shared->common_address, 0x1000,
+        common = VirtualAlloc((void *)shared->common_address, shared->mapping_size,
                 MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (common) target = VirtualAlloc((void *)shared->target_address, 0x1000,
+        if (common) target = VirtualAlloc((void *)shared->target_address, shared->mapping_size,
                 MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         shared->error[index] = !common || !target ? GetLastError() : 0;
         if (common && target)
         {
             *common = index ? 0xb2 : 0xa1;
             *target = index ? 0xd4 : 0xc3;
-            shared->collision_ok[index] = execution_collision_control(shared, common);
-            if (!map_execution_regions(shared, regions, shared->protection[index]))
-                shared->error[index] = GetLastError();
+            if (!shared->attachment_only)
+            {
+                shared->collision_ok[index] = execution_collision_control(shared, common);
+                if (!map_execution_regions(shared, regions, shared->protection[index]))
+                    shared->error[index] = GetLastError();
+            }
         }
     }
     SetEvent(ready);
     /* IPC and admission occur on the native stack. The bounded table-SEH mode
      * makes real exception/unwind calls on its truthfully described shared
      * stack. The parent grants it to only one serial owner at a time. */
-    if (common && target && !shared->error[index])
+    if (common && target && !shared->error[index] && shared->attachment_only)
+    {
+        WaitForSingleObject(stop, 30000);
+    }
+    else if (common && target && !shared->error[index])
     {
         events[0] = stop;
         events[1] = shared->run[index];
@@ -2838,6 +2852,513 @@ static BOOL stop_attachment_children(PROCESS_INFORMATION *children, HANDLE stop)
     }
     return reaped;
 }
+
+struct concurrent_attachment_call
+{
+    HANDLE file;
+    struct concurrent_attachment_input input;
+    struct concurrent_attachment_output output;
+    BOOL result;
+    DWORD error, bytes;
+};
+
+static DWORD WINAPI concurrent_attachment_call_thread(void *arg)
+{
+    struct concurrent_attachment_call *call = arg;
+
+    call->input.requestor_thread_id = GetCurrentThreadId();
+    call->result = DeviceIoControl(call->file, IOCTL_WINETEST_CONCURRENT_ATTACHMENT,
+            &call->input, sizeof(call->input), &call->output, sizeof(call->output),
+            &call->bytes, NULL);
+    call->error = call->result ? ERROR_SUCCESS : GetLastError();
+    return 0;
+}
+
+static BOOL reset_concurrent_attachment_fixture(void)
+{
+    DWORD bytes = 0;
+    BOOL ret = DeviceIoControl(device, IOCTL_WINETEST_CONCURRENT_RESET,
+            NULL, 0, NULL, 0, &bytes, NULL);
+
+    ok(ret, "concurrent attachment reset IOCTL failed, error %lu\n", GetLastError());
+    return ret;
+}
+
+static BOOL test_concurrent_admission_rejection(ULONG_PTR common_address)
+{
+    struct concurrent_attachment_input input = {0};
+    struct concurrent_attachment_output output;
+    DWORD old_protect, bytes = 0, error;
+    void *common;
+    BOOL ret, passed = TRUE;
+
+    /* The concurrent fixture already owns this declared caller extent.  Probe
+     * the executor's admission path by revoking access temporarily; reserving
+     * the same address again would fail because the fixture mapping is live. */
+    common = (void *)common_address;
+    ret = VirtualProtect(common, ATTACHMENT_RANGE_SIZE, PAGE_NOACCESS, &old_protect);
+    ok(ret, "admission rejection protection change failed, error %lu\n", GetLastError());
+    if (!ret)
+        return FALSE;
+
+    input.requestor_process_id = GetCurrentProcessId();
+    input.requestor_thread_id = GetCurrentThreadId();
+    input.common_address = common_address;
+    input.lane = 2; /* The driver rejects this only if attach admission reaches IoCallDriver. */
+    memset(&output, 0xcc, sizeof(output));
+    SetLastError(ERROR_SUCCESS);
+    ret = DeviceIoControl(device, IOCTL_WINETEST_CONCURRENT_ATTACHMENT, &input, sizeof(input),
+            &output, sizeof(output), &bytes, NULL);
+    error = GetLastError();
+    ok(!ret && error == ERROR_NOT_SUPPORTED && !bytes,
+            "no-access caller extent was not rejected before dispatch: result %d error %lu bytes %lu\n",
+            ret, error, bytes);
+    if (ret || error != ERROR_NOT_SUPPORTED || bytes) passed = FALSE;
+
+    ret = VirtualProtect(common, ATTACHMENT_RANGE_SIZE, PAGE_READWRITE, &old_protect);
+    ok(ret, "admission rejection protection restore failed, error %lu\n", GetLastError());
+    if (!ret) return FALSE;
+    if (ret)
+    {
+        bytes = 0;
+        memset(&output, 0xcc, sizeof(output));
+        SetLastError(ERROR_SUCCESS);
+        ret = DeviceIoControl(device, IOCTL_WINETEST_CONCURRENT_ATTACHMENT, &input, sizeof(input),
+                &output, sizeof(output), &bytes, NULL);
+        error = GetLastError();
+        ok(!ret && error == ERROR_INVALID_PARAMETER && !bytes,
+                "restored extent did not reach the driver's invalid-input check: result %d error %lu bytes %lu\n",
+                ret, error, bytes);
+        if (ret || error != ERROR_INVALID_PARAMETER || bytes) passed = FALSE;
+    }
+    return passed;
+}
+
+static BOOL test_same_thread_concurrent_admission(PROCESS_INFORMATION *children,
+        ULONG_PTR common_address, ULONG_PTR target_address)
+{
+    static struct concurrent_attachment_call same_thread_call, reject_call, peer_call;
+    static OVERLAPPED overlapped[2];
+    static HANDLE overlapped_device;
+    HANDLE peer_thread;
+    DWORD wait, error, bytes = 0;
+    BOOL ret, passed = TRUE, reject_completed = FALSE;
+
+    if (!reset_concurrent_attachment_fixture()) return FALSE;
+    overlapped_device = CreateFileA("\\\\.\\WineTestDriver", FILE_ALL_ACCESS, 0, NULL,
+            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    ok(overlapped_device != INVALID_HANDLE_VALUE,
+            "failed to open an overlapped driver handle, error %lu\n", GetLastError());
+    if (overlapped_device == INVALID_HANDLE_VALUE) return FALSE;
+
+    memset(&same_thread_call, 0, sizeof(same_thread_call));
+    memset(overlapped, 0, sizeof(overlapped));
+    same_thread_call.file = overlapped_device;
+    same_thread_call.input.process_id[0] = children[0].dwProcessId;
+    same_thread_call.input.process_id[1] = children[1].dwProcessId;
+    same_thread_call.input.requestor_process_id = GetCurrentProcessId();
+    same_thread_call.input.requestor_thread_id = GetCurrentThreadId();
+    same_thread_call.input.common_address = common_address;
+    same_thread_call.input.target_address = target_address;
+    same_thread_call.input.lane = 0;
+    overlapped[0].hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    overlapped[1].hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ok(overlapped[0].hEvent && overlapped[1].hEvent,
+            "failed to create overlapped completion events, error %lu\n", GetLastError());
+    if (!overlapped[0].hEvent || !overlapped[1].hEvent) return FALSE;
+
+    SetLastError(ERROR_SUCCESS);
+    ret = DeviceIoControl(overlapped_device, IOCTL_WINETEST_CONCURRENT_ATTACHMENT,
+            &same_thread_call.input, sizeof(same_thread_call.input), &same_thread_call.output,
+            sizeof(same_thread_call.output), &bytes, &overlapped[0]);
+    error = ret ? ERROR_SUCCESS : GetLastError();
+    ok(!ret && error == ERROR_IO_PENDING,
+            "first same-thread request was not left pending: result %d error %lu\n", ret, error);
+    if (ret || error != ERROR_IO_PENDING) passed = FALSE;
+
+    wait = WaitForSingleObject(overlapped[0].hEvent, 0);
+    ok(wait == WAIT_TIMEOUT, "first same-thread request completed before its peer: wait %#lx\n", wait);
+    if (wait != WAIT_TIMEOUT) passed = FALSE;
+
+    /* A second request from this same caller thread must fail admission before
+     * the driver sees the deliberately invalid lane value. */
+    reject_call.file = overlapped_device;
+    reject_call.input = same_thread_call.input;
+    reject_call.input.lane = 2;
+    memset(&reject_call.output, 0xcc, sizeof(reject_call.output));
+    bytes = 0;
+    SetLastError(ERROR_SUCCESS);
+    ret = DeviceIoControl(overlapped_device, IOCTL_WINETEST_CONCURRENT_ATTACHMENT,
+            &reject_call.input, sizeof(reject_call.input), &reject_call.output,
+            sizeof(reject_call.output), &bytes, &overlapped[1]);
+    error = ret ? ERROR_SUCCESS : GetLastError();
+    if (!ret && error == ERROR_BUSY) reject_completed = TRUE;
+    if (!ret && error == ERROR_IO_PENDING)
+    {
+        wait = WaitForSingleObject(overlapped[1].hEvent, 15000);
+        ok(wait == WAIT_OBJECT_0, "same-thread rejection probe did not finish within bound: wait %#lx\n", wait);
+        if (wait == WAIT_OBJECT_0)
+        {
+            reject_completed = TRUE;
+            ret = GetOverlappedResult(overlapped_device, &overlapped[1], &bytes, FALSE);
+            error = ret ? ERROR_SUCCESS : GetLastError();
+        }
+    }
+    ok(!ret && error == ERROR_BUSY && !bytes,
+            "second same-thread request was not rejected as busy: result %d error %lu bytes %lu\n",
+            ret, error, bytes);
+    if (ret || error != ERROR_BUSY || bytes) passed = FALSE;
+    wait = WaitForSingleObject(overlapped[0].hEvent, 0);
+    ok(wait == WAIT_TIMEOUT, "same-thread rejection disturbed first pending request: wait %#lx\n", wait);
+    if (wait != WAIT_TIMEOUT) passed = FALSE;
+
+    /* A distinct caller thread must still acquire the other executor slot and
+     * release the first lane's real driver barrier. */
+    memset(&peer_call, 0, sizeof(peer_call));
+    peer_call.file = device;
+    peer_call.input.process_id[0] = children[0].dwProcessId;
+    peer_call.input.process_id[1] = children[1].dwProcessId;
+    peer_call.input.requestor_process_id = GetCurrentProcessId();
+    peer_call.input.common_address = common_address;
+    peer_call.input.target_address = target_address;
+    peer_call.input.lane = 1;
+    peer_thread = CreateThread(NULL, 0, concurrent_attachment_call_thread, &peer_call, 0, NULL);
+    ok(!!peer_thread, "distinct peer caller thread creation failed, error %lu\n", GetLastError());
+    if (!peer_thread) return FALSE;
+
+    wait = WaitForSingleObject(peer_thread, 20000);
+    ok(wait == WAIT_OBJECT_0, "distinct peer caller did not complete within bound: wait %#lx\n", wait);
+    if (wait != WAIT_OBJECT_0) passed = FALSE;
+    wait = WaitForSingleObject(overlapped[0].hEvent, 20000);
+    ok(wait == WAIT_OBJECT_0, "first same-thread request did not complete after peer dispatch: wait %#lx\n", wait);
+    if (wait == WAIT_OBJECT_0)
+    {
+        bytes = 0;
+        ret = GetOverlappedResult(overlapped_device, &overlapped[0], &bytes, FALSE);
+        error = ret ? ERROR_SUCCESS : GetLastError();
+        ok(ret && bytes == sizeof(same_thread_call.output),
+                "first same-thread request completion result %d error %lu bytes %lu\n",
+                ret, error, bytes);
+        if (!ret || bytes != sizeof(same_thread_call.output)) passed = FALSE;
+    }
+    ok(peer_call.result && peer_call.bytes == sizeof(peer_call.output),
+            "distinct peer request failed result %d bytes %lu error %lu\n",
+            peer_call.result, peer_call.bytes, peer_call.error);
+    if (!peer_call.result || peer_call.bytes != sizeof(peer_call.output)) passed = FALSE;
+    ok(same_thread_call.output.barrier_mask == 0xff && peer_call.output.barrier_mask == 0xff,
+            "same-thread rejection pair barrier masks %#lx/%#lx expected 0xff\n",
+            same_thread_call.output.barrier_mask, peer_call.output.barrier_mask);
+    if (same_thread_call.output.barrier_mask != 0xff || peer_call.output.barrier_mask != 0xff)
+        passed = FALSE;
+    ok(same_thread_call.output.observations[0].common_value == 0xa1
+            && same_thread_call.output.observations[0].target_value == 0xc3
+            && peer_call.output.observations[0].common_value == 0xb2
+            && peer_call.output.observations[0].target_value == 0xd4,
+            "same-thread rejection pair did not preserve independent lane views\n");
+    if (same_thread_call.output.observations[0].common_value != 0xa1
+            || same_thread_call.output.observations[0].target_value != 0xc3
+            || peer_call.output.observations[0].common_value != 0xb2
+            || peer_call.output.observations[0].target_value != 0xd4) passed = FALSE;
+    ok(same_thread_call.input.requestor_thread_id == same_thread_call.output.observations[0].current_thread_id
+            && same_thread_call.output.observations[0].current_thread_id
+                != peer_call.output.observations[0].current_thread_id
+            && peer_call.input.requestor_thread_id == peer_call.output.observations[0].current_thread_id,
+            "same-thread rejection pair did not preserve distinct logical caller identities\n");
+    if (same_thread_call.input.requestor_thread_id != same_thread_call.output.observations[0].current_thread_id
+            || same_thread_call.output.observations[0].current_thread_id
+                == peer_call.output.observations[0].current_thread_id
+            || peer_call.input.requestor_thread_id != peer_call.output.observations[0].current_thread_id)
+        passed = FALSE;
+    if (passed)
+        trace("same-thread admission: TID %Iu duplicate lane 2 returned ERROR_BUSY while lane 0 was pending; peer TID %Iu completed overlap %#lx with bytes A/B=%#x/%#x\n",
+                same_thread_call.input.requestor_thread_id, peer_call.input.requestor_thread_id,
+                peer_call.output.barrier_mask, same_thread_call.output.observations[0].common_value,
+                peer_call.output.observations[0].common_value);
+
+    if (WaitForSingleObject(peer_thread, 0) == WAIT_OBJECT_0
+            && WaitForSingleObject(overlapped[0].hEvent, 0) == WAIT_OBJECT_0
+            && reject_completed)
+    {
+        CloseHandle(peer_thread);
+        CloseHandle(overlapped[0].hEvent);
+        CloseHandle(overlapped[1].hEvent);
+        CloseHandle(overlapped_device);
+        peer_thread = NULL;
+        overlapped[0].hEvent = overlapped[1].hEvent = NULL;
+        overlapped_device = INVALID_HANDLE_VALUE;
+    }
+    return passed;
+}
+
+static void check_concurrent_observation(const struct concurrent_attachment_observation *observation,
+        const struct concurrent_attachment_call *call, unsigned int phase, const char *phase_name,
+        BYTE common_value, NTSTATUS target_status, BYTE target_value, DWORD process_id)
+{
+    ULONG expected_state = ATTACHMENT_STATE_GLOBAL | ATTACHMENT_STATE_POOL | ATTACHMENT_STATE_STACK
+            | ATTACHMENT_STATE_IRP | ATTACHMENT_STATE_SYSTEM_BUFFER | ATTACHMENT_STATE_PROCESS_REFS
+            | ATTACHMENT_STATE_THREAD | ATTACHMENT_STATE_KAPC_STORAGE;
+    BOOL attached = process_id != GetCurrentProcessId();
+
+    ok(!observation->common_status && observation->common_value == common_value,
+            "lane %lu phase %s common status/value %#lx/%#x expected %#x\n", call->input.lane,
+            phase_name, observation->common_status, observation->common_value, common_value);
+    ok(observation->target_status == target_status
+            && (!target_status ? observation->target_value == target_value : TRUE),
+            "lane %lu phase %s target status/value %#lx/%#x expected %#lx/%#x\n", call->input.lane,
+            phase_name, observation->target_status, observation->target_value,
+            target_status, target_value);
+    ok(observation->kernel_state == expected_state,
+            "lane %lu phase %s kernel-state mask %#lx expected %#lx\n", call->input.lane,
+            phase_name, observation->kernel_state, expected_state);
+    ok(observation->requestor_process_id == call->input.requestor_process_id
+            && observation->requestor_thread_id == call->input.requestor_thread_id
+            && observation->current_process_id == process_id,
+            "lane %lu phase %s identities caller/thread/current %#Ix/%#Ix/%#Ix expected %#Ix/%#Ix/%lu\n",
+            call->input.lane, phase_name, observation->requestor_process_id,
+            observation->requestor_thread_id, observation->current_process_id,
+            call->input.requestor_process_id, call->input.requestor_thread_id, process_id);
+    ok(observation->process_reference[0] && observation->process_reference[1],
+            "lane %lu phase %s missing referenced process objects\n", call->input.lane, phase_name);
+    ok(observation->current_process == (attached
+                    ? observation->process_reference[observation->current_process_id == call->input.process_id[1]]
+                    : observation->caller_process),
+            "lane %lu phase %s attached process object does not match its process reference\n",
+            call->input.lane, phase_name);
+    if (attached)
+        ok(observation->kapc_process == observation->caller_process,
+                "lane %lu phase %s KAPC_STATE previous process %p expected caller %p\n", call->input.lane,
+                phase_name, (void *)observation->kapc_process, (void *)observation->caller_process);
+    ok(observation->current_thread_id && observation->current_thread
+            && observation->irp && observation->io_stack && observation->system_buffer
+            && observation->driver_global && observation->pool_allocation && observation->stack_local
+            && observation->stack_cookie == 0x434f4e435354414bull,
+            "lane %lu phase %s missing thread/IRP/stack/global/pool state\n", call->input.lane, phase_name);
+    ok(observation->global_value == 0x474c4f42414c4231ll
+            && observation->pool_value == 0x504f4f4c42303031ll,
+            "lane %lu phase %s shared global/pool values %#I64x/%#I64x\n", call->input.lane,
+            phase_name, observation->global_value, observation->pool_value);
+    if (!attached)
+        ok(observation->current_process_id == call->input.requestor_process_id,
+                "lane %lu phase %s did not return to caller process\n", call->input.lane, phase_name);
+    (void)phase;
+}
+
+static BOOL run_concurrent_attachment_pair(PROCESS_INFORMATION *children, ULONG_PTR common_address,
+        ULONG_PTR target_address, BOOL fault_pair)
+{
+    static struct concurrent_attachment_call saved_calls[4][2];
+    static unsigned int saved_call_set;
+    static const char * const phases[CONCURRENT_ATTACHMENT_PHASES] = {
+        "initial attachment", "peer transition one", "same-target phase",
+        "peer transition two", "crossed targets", "restored caller"
+    };
+    static const BYTE common_value[2][CONCURRENT_ATTACHMENT_PHASES] = {
+        {0xa1, 0x59, 0xb2, 0xb2, 0xb2, 0x59},
+        {0xb2, 0xb2, 0xb2, 0x59, 0xa1, 0x59}
+    };
+    static const BYTE target_value[2][CONCURRENT_ATTACHMENT_PHASES] = {
+        {0xc3, 0, 0xd4, 0xd4, 0xd4, 0},
+        {0xd4, 0xd4, 0xd4, 0, 0xc3, 0}
+    };
+    static const DWORD process_index[2][CONCURRENT_ATTACHMENT_PHASES] = {
+        {0, (DWORD)-1, 1, 1, 1, (DWORD)-1},
+        {1, 1, 1, (DWORD)-1, 0, (DWORD)-1}
+    };
+    struct concurrent_attachment_call *calls;
+    HANDLE threads[2] = {NULL, NULL};
+    DWORD waits[2];
+    unsigned int lane, phase;
+    BOOL all_done = TRUE;
+
+    if (saved_call_set >= ARRAY_SIZE(saved_calls))
+    {
+        ok(0, "concurrent attachment test exhausted its bounded caller-context slots\n");
+        return FALSE;
+    }
+    calls = saved_calls[saved_call_set++];
+    memset(calls, 0, sizeof(saved_calls[0]));
+    if (!reset_concurrent_attachment_fixture()) return FALSE;
+    for (lane = 0; lane < 2; ++lane)
+    {
+        calls[lane].file = device;
+        calls[lane].input.process_id[0] = children[0].dwProcessId;
+        calls[lane].input.process_id[1] = children[1].dwProcessId;
+        calls[lane].input.requestor_process_id = GetCurrentProcessId();
+        calls[lane].input.common_address = common_address;
+        calls[lane].input.target_address = target_address;
+        calls[lane].input.lane = lane;
+        calls[lane].input.flags = fault_pair ? CONCURRENT_ATTACHMENT_INPUT_FAULT : 0;
+        threads[lane] = CreateThread(NULL, 0, concurrent_attachment_call_thread, &calls[lane], 0, NULL);
+        ok(!!threads[lane], "concurrent attachment caller lane %u thread creation failed, error %lu\n",
+                lane, GetLastError());
+        if (!threads[lane]) { all_done = FALSE; break; }
+    }
+
+    if (threads[0] && threads[1] && fault_pair)
+    {
+        waits[0] = WaitForSingleObject(threads[0], 15000);
+        ok(waits[0] == WAIT_OBJECT_0, "faulting lane caller did not finish within bound: %#lx\n", waits[0]);
+        if (waits[0] == WAIT_OBJECT_0)
+        {
+            ok(!calls[0].result && calls[0].error == ERROR_NOACCESS && !calls[0].bytes,
+                    "faulting lane returned %d/error %lu/bytes %lu\n",
+                    calls[0].result, calls[0].error, calls[0].bytes);
+            waits[1] = WaitForSingleObject(threads[1], 0);
+            ok(waits[1] == WAIT_TIMEOUT,
+                    "peer lane completed before the faulting request returned (wait %#lx)\n", waits[1]);
+        }
+        waits[1] = WaitForSingleObject(threads[1], 10000);
+        ok(waits[1] == WAIT_OBJECT_0, "healthy peer caller did not finish within bound: %#lx\n", waits[1]);
+        if (waits[1] == WAIT_OBJECT_0)
+        {
+            ok(calls[1].result && calls[1].bytes == sizeof(calls[1].output),
+                    "healthy peer request failed result %d bytes %lu error %lu\n",
+                    calls[1].result, calls[1].bytes, calls[1].error);
+            ok(calls[1].output.fault_peer_reads >= 1000,
+                    "healthy peer completed only %lu reads after the other lane faulted\n",
+                    calls[1].output.fault_peer_reads);
+            ok(calls[1].output.observations[0].common_value == 0xb2
+                    && calls[1].output.observations[0].target_value == 0xd4
+                    && calls[1].output.observations[0].current_process_id == children[1].dwProcessId
+                    && calls[1].output.observations[0].current_thread_id == calls[1].input.requestor_thread_id
+                    && calls[1].output.observations[0].kernel_state
+                        == (ATTACHMENT_STATE_GLOBAL | ATTACHMENT_STATE_POOL | ATTACHMENT_STATE_STACK
+                            | ATTACHMENT_STATE_IRP | ATTACHMENT_STATE_SYSTEM_BUFFER
+                            | ATTACHMENT_STATE_PROCESS_REFS | ATTACHMENT_STATE_THREAD
+                            | ATTACHMENT_STATE_KAPC_STORAGE),
+                    "healthy peer lost its attached B view or kernel state while lane A faulted\n");
+            ok(calls[1].output.observations[1].common_value == 0xb2
+                    && calls[1].output.observations[1].target_value == 0xd4
+                    && calls[1].output.observations[1].current_process_id == children[1].dwProcessId
+                    && calls[1].output.observations[1].current_process
+                        == calls[1].output.observations[1].process_reference[1]
+                    && calls[1].output.observations[1].kapc_process
+                        == calls[1].output.observations[1].caller_process
+                    && calls[1].output.observations[1].current_thread_id
+                        == calls[1].input.requestor_thread_id
+                    && calls[1].output.observations[1].irp
+                        == calls[1].output.observations[0].irp
+                    && calls[1].output.observations[1].system_buffer
+                        == calls[1].output.observations[0].system_buffer
+                    && calls[1].output.observations[1].kapc_state
+                        == calls[1].output.observations[0].kapc_state
+                    && calls[1].output.observations[1].pool_allocation
+                        == calls[1].output.observations[0].pool_allocation
+                    && calls[1].output.observations[1].kernel_state
+                        == (ATTACHMENT_STATE_GLOBAL | ATTACHMENT_STATE_POOL | ATTACHMENT_STATE_STACK
+                            | ATTACHMENT_STATE_IRP | ATTACHMENT_STATE_SYSTEM_BUFFER
+                            | ATTACHMENT_STATE_PROCESS_REFS | ATTACHMENT_STATE_THREAD
+                            | ATTACHMENT_STATE_KAPC_STORAGE),
+                    "healthy peer kernel state changed after lane A faulted\n");
+        }
+        all_done = waits[0] == WAIT_OBJECT_0 && waits[1] == WAIT_OBJECT_0
+                && !calls[0].result && calls[0].error == ERROR_NOACCESS
+                && calls[1].result && calls[1].bytes == sizeof(calls[1].output)
+                && calls[1].output.fault_peer_reads >= 1000;
+    }
+    else if (threads[0] && threads[1])
+    {
+        HANDLE both[2] = {threads[0], threads[1]};
+        DWORD wait = WaitForMultipleObjects(2, both, TRUE, 20000);
+        ok(wait == WAIT_OBJECT_0, "concurrent caller threads did not both complete within bound: %#lx\n", wait);
+        all_done = wait == WAIT_OBJECT_0;
+        for (lane = 0; lane < 2; ++lane)
+            ok(calls[lane].result && calls[lane].bytes == sizeof(calls[lane].output),
+                    "concurrent lane %u request result %d bytes %lu error %lu\n",
+                    lane, calls[lane].result, calls[lane].bytes, calls[lane].error);
+
+        if (all_done && calls[0].result && calls[1].result)
+        {
+            for (lane = 0; lane < 2; ++lane)
+            {
+                trace("concurrent lane %u overlap mask %#lx caller TID %Iu logical TID %Iu KTHREAD %p IRP %p SystemBuffer %p IOStack %p KAPC %p stack-local %p phases A/B=%#x/%#x crossed=%#x/%#x\n",
+                        lane, calls[lane].output.barrier_mask, calls[lane].input.requestor_thread_id,
+                        calls[lane].output.observations[0].current_thread_id,
+                        (void *)calls[lane].output.observations[0].current_thread,
+                        (void *)calls[lane].output.observations[0].irp,
+                        (void *)calls[lane].output.observations[0].system_buffer,
+                        (void *)calls[lane].output.observations[0].io_stack,
+                        (void *)calls[lane].output.observations[0].kapc_state,
+                        (void *)calls[lane].output.observations[0].stack_local,
+                        calls[lane].output.observations[0].common_value,
+                        calls[lane].output.observations[0].target_value,
+                        calls[lane].output.observations[4].common_value,
+                        calls[lane].output.observations[4].target_value);
+                ok(calls[lane].output.barrier_mask == 0xff,
+                        "concurrent lane %u rendezvous mask %#lx expected 0xff\n",
+                        lane, calls[lane].output.barrier_mask);
+                for (phase = 0; phase < CONCURRENT_ATTACHMENT_PHASES; ++phase)
+                {
+                    DWORD pid = process_index[lane][phase] == (DWORD)-1
+                            ? GetCurrentProcessId() : children[process_index[lane][phase]].dwProcessId;
+                    NTSTATUS target_status = process_index[lane][phase] == (DWORD)-1
+                            ? STATUS_ACCESS_VIOLATION : STATUS_SUCCESS;
+                    check_concurrent_observation(&calls[lane].output.observations[phase], &calls[lane],
+                            phase, phases[phase], common_value[lane][phase], target_status,
+                            target_value[lane][phase], pid);
+                }
+                if (!lane)
+                    ok(calls[lane].output.observations[3].read_count >= 64,
+                            "lane A made only %lu reads while lane B was detached\n",
+                            calls[lane].output.observations[3].read_count);
+                else
+                    ok(calls[lane].output.observations[1].read_count >= 64,
+                            "lane B made only %lu reads while lane A was detached\n",
+                            calls[lane].output.observations[1].read_count);
+            }
+            for (phase = 0; phase < CONCURRENT_ATTACHMENT_PHASES; ++phase)
+            {
+                const struct concurrent_attachment_observation *a = &calls[0].output.observations[phase];
+                const struct concurrent_attachment_observation *b = &calls[1].output.observations[phase];
+                ok(a->driver_global == b->driver_global && a->pool_allocation == b->pool_allocation,
+                        "phase %s shared driver global/pool pointers differ: %p/%p and %p/%p\n",
+                        phases[phase], (void *)a->driver_global, (void *)b->driver_global,
+                        (void *)a->pool_allocation, (void *)b->pool_allocation);
+            }
+            ok(calls[0].output.observations[0].current_thread_id
+                    != calls[1].output.observations[0].current_thread_id
+                    && calls[0].output.observations[0].current_thread
+                    != calls[1].output.observations[0].current_thread
+                    && calls[0].output.observations[0].requestor_thread_id
+                    != calls[1].output.observations[0].requestor_thread_id,
+                    "two caller requests reused one logical KTHREAD identity\n");
+            ok(calls[0].output.observations[0].irp != calls[1].output.observations[0].irp
+                    && calls[0].output.observations[0].system_buffer
+                        != calls[1].output.observations[0].system_buffer
+                    && calls[0].output.observations[0].io_stack != calls[1].output.observations[0].io_stack
+                    && calls[0].output.observations[0].kapc_state != calls[1].output.observations[0].kapc_state
+                    && calls[0].output.observations[0].stack_local != calls[1].output.observations[0].stack_local,
+                    "two concurrent requests share per-thread IRP/SystemBuffer/stack/KAPC storage\n");
+            for (lane = 0; lane < 2; ++lane)
+                for (phase = 1; phase < CONCURRENT_ATTACHMENT_PHASES; ++phase)
+                {
+                    const struct concurrent_attachment_observation *a = &calls[lane].output.observations[0];
+                    const struct concurrent_attachment_observation *b = &calls[lane].output.observations[phase];
+                    ok(a->current_thread_id == b->current_thread_id && a->current_thread == b->current_thread
+                            && a->irp == b->irp && a->io_stack == b->io_stack
+                            && a->system_buffer == b->system_buffer && a->kapc_state == b->kapc_state
+                            && a->process_reference[0] == b->process_reference[0]
+                            && a->process_reference[1] == b->process_reference[1]
+                            && a->driver_global == b->driver_global && a->pool_allocation == b->pool_allocation
+                            && a->stack_local == b->stack_local,
+                            "lane %u phase %s changed thread/IRP/stack/KAPC/reference canaries\n",
+                            lane, phases[phase]);
+                }
+        }
+    }
+    else
+        all_done = FALSE;
+
+    for (lane = 0; lane < 2; ++lane)
+        if (threads[lane])
+        {
+            DWORD wait = WaitForSingleObject(threads[lane], 15000);
+            ok(wait == WAIT_OBJECT_0, "concurrent lane %u caller remained active: %#lx\n", lane, wait);
+            if (wait != WAIT_OBJECT_0) all_done = FALSE;
+            CloseHandle(threads[lane]);
+        }
+    return all_done;
+}
 #endif
 
 static void test_process_attachment(void)
@@ -2851,6 +3372,7 @@ static void test_process_attachment(void)
     STARTUPINFOA startup = {sizeof(startup)};
     struct attachment_shared *shared = NULL;
     struct attachment_output output;
+    struct attachment_output healthy_output;
     struct attachment_input input;
     MEMORY_BASIC_INFORMATION info;
     HANDLE mapping = NULL, ready[2] = {NULL, NULL}, stop = NULL;
@@ -2859,9 +3381,24 @@ static void test_process_attachment(void)
     DWORD protection[3];
     char executable[MAX_PATH], command[MAX_PATH + 128];
     BYTE *common = NULL;
+    const char *range_opt_in = getenv("WINE_EXPERIMENTAL_ATTACH_RANGES");
+    const char *concurrency_opt_in = getenv("WINE_EXPERIMENTAL_DRIVER_CONCURRENCY");
     DWORD size, wait;
     unsigned int attempt, i;
-    BOOL ret, fixture_ready = FALSE;
+    BOOL ret, fixture_ready = FALSE, concurrent_attachment = !!concurrency_opt_in;
+    BOOL strict_attachment = !!range_opt_in || concurrent_attachment;
+
+    if (strict_attachment)
+        ok(range_opt_in && !strcmp(range_opt_in, ATTACHMENT_RUNTIME_RANGES),
+                "unexpected WINE_EXPERIMENTAL_ATTACH_RANGES value '%s'\n",
+                range_opt_in ? range_opt_in : "<unset>");
+    if (concurrent_attachment)
+    {
+        ok(!strcmp(concurrency_opt_in, "2"),
+                "unexpected WINE_EXPERIMENTAL_DRIVER_CONCURRENCY value '%s'\n", concurrency_opt_in);
+        if (!range_opt_in || strcmp(range_opt_in, ATTACHMENT_RUNTIME_RANGES)
+                || strcmp(concurrency_opt_in, "2")) return;
+    }
 
     if (!GetModuleFileNameA(NULL, executable, sizeof(executable)))
     {
@@ -2875,7 +3412,7 @@ static void test_process_attachment(void)
     for (i = 0; i < 2; ++i) ready[i] = CreateEventA(&sa, TRUE, FALSE, NULL);
     ok(shared && stop && ready[0] && ready[1], "attachment IPC setup failed, error %lu\n", GetLastError());
     if (!shared || !stop || !ready[0] || !ready[1]) goto cleanup;
-    for (i = 0; i < 3; ++i)
+    if (!strict_attachment) for (i = 0; i < 3; ++i)
     {
         execution_mapping[i] = CreateFileMappingA(INVALID_HANDLE_VALUE, &sa,
                 i ? PAGE_READWRITE : PAGE_EXECUTE_READWRITE, 0, EXECUTION_REGION_SIZE, NULL);
@@ -2885,46 +3422,51 @@ static void test_process_attachment(void)
     }
     /* Only this temporary initialization view is writable; all executing
      * views have RX code and separate nonexecutable RW data and stack. */
-    code_init = MapViewOfFile(execution_mapping[0], FILE_MAP_WRITE, 0, 0, EXECUTION_REGION_SIZE);
-    ok(!!code_init, "A1b code initialization map failed, error %lu\n", GetLastError());
-    if (!code_init) goto cleanup;
-    ok(continuation_code_end - continuation_code_start < EXECUTION_REGION_SIZE - CONTINUATION_CODE_OFFSET,
-            "A1b continuation exceeds shared code region\n");
-    if (continuation_code_end - continuation_code_start >= EXECUTION_REGION_SIZE - CONTINUATION_CODE_OFFSET)
-        goto cleanup;
-    ok(continuation_code_end - continuation_code_start < CONTINUATION_UNWIND_OFFSET - CONTINUATION_CODE_OFFSET,
-            "A1b continuation overlaps immutable unwind metadata\n");
-    if (continuation_code_end - continuation_code_start >= CONTINUATION_UNWIND_OFFSET - CONTINUATION_CODE_OFFSET)
-        goto cleanup;
-    memcpy(code_init, execution_code, sizeof(execution_code));
-    memcpy((BYTE *)code_init + CONTINUATION_CODE_OFFSET, continuation_code_start,
-            continuation_code_end - continuation_code_start);
-    initialize_continuation_unwind_info(code_init);
-    FlushInstructionCache(GetCurrentProcess(), code_init, EXECUTION_REGION_SIZE);
-    UnmapViewOfFile(code_init);
-    code_init = NULL;
-    for (i = 0; i < 2; ++i)
+    if (!strict_attachment)
     {
-        shared->run[i] = run[i] = CreateEventA(&sa, FALSE, FALSE, NULL);
-        shared->done[i] = done[i] = CreateEventA(&sa, FALSE, FALSE, NULL);
-        ok(run[i] && done[i], "A1b child %u handoff events failed, error %lu\n", i, GetLastError());
-        if (!run[i] || !done[i]) goto cleanup;
+        code_init = MapViewOfFile(execution_mapping[0], FILE_MAP_WRITE, 0, 0, EXECUTION_REGION_SIZE);
+        ok(!!code_init, "A1b code initialization map failed, error %lu\n", GetLastError());
+        if (!code_init) goto cleanup;
+        ok(continuation_code_end - continuation_code_start < EXECUTION_REGION_SIZE - CONTINUATION_CODE_OFFSET,
+                "A1b continuation exceeds shared code region\n");
+        if (continuation_code_end - continuation_code_start >= EXECUTION_REGION_SIZE - CONTINUATION_CODE_OFFSET)
+            goto cleanup;
+        ok(continuation_code_end - continuation_code_start < CONTINUATION_UNWIND_OFFSET - CONTINUATION_CODE_OFFSET,
+                "A1b continuation overlaps immutable unwind metadata\n");
+        if (continuation_code_end - continuation_code_start >= CONTINUATION_UNWIND_OFFSET - CONTINUATION_CODE_OFFSET)
+            goto cleanup;
+        memcpy(code_init, execution_code, sizeof(execution_code));
+        memcpy((BYTE *)code_init + CONTINUATION_CODE_OFFSET, continuation_code_start,
+                continuation_code_end - continuation_code_start);
+        initialize_continuation_unwind_info(code_init);
+        FlushInstructionCache(GetCurrentProcess(), code_init, EXECUTION_REGION_SIZE);
+        UnmapViewOfFile(code_init);
+        code_init = NULL;
+        for (i = 0; i < 2; ++i)
+        {
+            shared->run[i] = run[i] = CreateEventA(&sa, FALSE, FALSE, NULL);
+            shared->done[i] = done[i] = CreateEventA(&sa, FALSE, FALSE, NULL);
+            ok(run[i] && done[i], "A1b child %u handoff events failed, error %lu\n", i, GetLastError());
+            if (!run[i] || !done[i]) goto cleanup;
+        }
     }
 
     /* Low, allocation-granularity-aligned candidates work on native x64 too.
      * Retry address collisions; the children remain live throughout the IOCTL. */
-    for (attempt = 0; attempt < 6; ++attempt)
+    shared->attachment_only = strict_attachment;
+    shared->mapping_size = strict_attachment ? ATTACHMENT_RANGE_SIZE : 0x1000;
+    for (attempt = 0; attempt < (strict_attachment ? 1u : 6u); ++attempt)
     {
-        shared->common_address = 0x18000000 + attempt * 0x10000000;
-        shared->target_address = shared->common_address + 0x10000;
+        shared->common_address = strict_attachment ? ATTACHMENT_COMMON_BASE : 0x18000000 + attempt * 0x10000000;
+        shared->target_address = strict_attachment ? ATTACHMENT_TARGET_BASE : shared->common_address + 0x10000;
         if (!VirtualQuery((void *)shared->target_address, &info, sizeof(info)) || info.State != MEM_FREE)
             continue;
-        common = VirtualAlloc((void *)shared->common_address, 0x1000,
+        common = VirtualAlloc((void *)shared->common_address, shared->mapping_size,
                 MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (!common) continue;
         *common = common_values[0];
         for (i = 0; i < 3; ++i) shared->execution_address[i] = shared->common_address + 0x20000 + i * 0x10000;
-        if (!map_execution_regions(shared, regions, protection))
+        if (!strict_attachment && !map_execution_regions(shared, regions, protection))
         {
             trace("A1b caller mapping candidate unavailable, error %lu\n", GetLastError());
             for (i = 0; i < 3; ++i)
@@ -2936,10 +3478,13 @@ static void test_process_attachment(void)
             common = NULL;
             continue;
         }
-        memset(regions[1], 0, sizeof(struct execution_data));
-        memset(regions[2], 0, EXECUTION_REGION_SIZE);
-        *(DWORD *)regions[2] = 0x31415926;
-        *(DWORD *)((BYTE *)regions[2] + EXECUTION_REGION_SIZE - 4) = 0x27182818;
+        if (!strict_attachment)
+        {
+            memset(regions[1], 0, sizeof(struct execution_data));
+            memset(regions[2], 0, EXECUTION_REGION_SIZE);
+            *(DWORD *)regions[2] = 0x31415926;
+            *(DWORD *)((BYTE *)regions[2] + EXECUTION_REGION_SIZE - 4) = 0x27182818;
+        }
         ResetEvent(stop);
         fixture_ready = TRUE;
         for (i = 0; i < 2; ++i)
@@ -2974,6 +3519,12 @@ static void test_process_attachment(void)
         VirtualFree(common, 0, MEM_RELEASE);
         common = NULL;
     }
+    if (!fixture_ready && strict_attachment)
+    {
+        ok(0, "Could not establish the fixed opt-in target mappings at %#Ix and %#Ix, child errors %lu/%lu\n",
+                shared->common_address, shared->target_address, shared->error[0], shared->error[1]);
+        goto cleanup;
+    }
     if (!fixture_ready)
     {
         skip("Could not establish two live processes at the same virtual address.\n");
@@ -2984,28 +3535,41 @@ static void test_process_attachment(void)
     if (!ret || info.State != MEM_FREE) goto cleanup;
     input.process_id[0] = children[0].dwProcessId;
     input.process_id[1] = children[1].dwProcessId;
+    input.requestor_process_id = GetCurrentProcessId();
     input.common_address = shared->common_address;
     input.target_address = shared->target_address;
+    input.flags = strict_attachment ? ATTACHMENT_INPUT_STRICT_STATE | ATTACHMENT_INPUT_FAULT_AFTER_ATTACH : 0;
     for (i = 0; i < 2; ++i)
     {
         wait = WaitForSingleObject(children[i].hProcess, 0);
         ok(wait == WAIT_TIMEOUT, "attachment child %u is no longer live, wait %#lx\n", i, wait);
         if (wait != WAIT_TIMEOUT) goto cleanup;
     }
-    if (!test_execution_regions(shared, regions, common, children)) goto cleanup;
-    if (!test_continuation(shared, regions, children)) goto cleanup;
-    if (!test_fault_continuation(shared, regions, children)) goto cleanup;
-    if (!test_unwind_continuation(shared, regions, children, FALSE)) goto cleanup;
+    if (concurrent_attachment)
+    {
+        trace("two-thread attachment gate: two outstanding buffered dispatches, independent caller thread identities, targets %lu/%lu\n",
+                children[0].dwProcessId, children[1].dwProcessId);
+        if (!test_same_thread_concurrent_admission(children, input.common_address, input.target_address)
+                || !run_concurrent_attachment_pair(children, input.common_address, input.target_address, FALSE)
+                || !run_concurrent_attachment_pair(children, input.common_address, input.target_address, TRUE)
+                || !test_concurrent_admission_rejection(input.common_address)
+                || !run_concurrent_attachment_pair(children, input.common_address, input.target_address, FALSE))
+            goto cleanup;
+    }
+    if (!strict_attachment && !test_execution_regions(shared, regions, common, children)) goto cleanup;
+    if (!strict_attachment && !test_continuation(shared, regions, children)) goto cleanup;
+    if (!strict_attachment && !test_fault_continuation(shared, regions, children)) goto cleanup;
+    if (!strict_attachment && !test_unwind_continuation(shared, regions, children, FALSE)) goto cleanup;
 #ifdef USE_COMPILER_EXCEPTIONS
-    if (!test_unwind_continuation(shared, regions, children, TRUE)) goto cleanup;
+    if (!strict_attachment && !test_unwind_continuation(shared, regions, children, TRUE)) goto cleanup;
 #else
-    skip("A1b compiler finally requires native compiler __try/__finally support\n");
+    if (!strict_attachment) skip("A1b compiler finally requires native compiler __try/__finally support\n");
 #endif
     /* A newly initialized full continuation after all fault cleanups must still
      * complete all five phases before the unchanged E05 driver fixture. */
-    if (!test_continuation(shared, regions, children)) goto cleanup;
-    /* Keep the original E05 IOCTL and its eight todos independent of the
-     * successful cooperative gate: real KeStackAttachProcess is unchanged. */
+    if (!strict_attachment && !test_continuation(shared, regions, children)) goto cleanup;
+    /* The strict runtime run issues only this compiled driver's buffered
+     * attachment IOCTL; cooperative A1b fixtures are deliberately bypassed. */
     memset(&output, 0xcc, sizeof(output));
     size = 0;
     ret = DeviceIoControl(device, IOCTL_WINETEST_PROCESS_ATTACHMENT, &input, sizeof(input),
@@ -3030,18 +3594,178 @@ static void test_process_attachment(void)
         NTSTATUS target_status = i && i != 4 ? STATUS_SUCCESS : STATUS_ACCESS_VIOLATION;
         trace("attachment %s: common status %#lx byte %#x; target status %#lx byte %#x\n", phases[i],
                 observation->common_status, observation->common_value, observation->target_status, observation->target_value);
-        /* Wine's driver host is separate from the caller, and attachment is
-         * currently a no-op. Keep every ordinary read visible as a todo. */
-        todo_wine ok(!observation->common_status && observation->common_value == common_values[i],
-                "attachment %s common: status %#lx byte %#x, expected %#x\n", phases[i],
-                observation->common_status, observation->common_value, common_values[i]);
+        if (strict_attachment)
+            ok(!observation->common_status && observation->common_value == common_values[i],
+                    "attachment %s common: status %#lx byte %#x, expected %#x\n", phases[i],
+                    observation->common_status, observation->common_value, common_values[i]);
+        else
+            todo_wine ok(!observation->common_status && observation->common_value == common_values[i],
+                    "attachment %s common: status %#lx byte %#x, expected %#x\n", phases[i],
+                    observation->common_status, observation->common_value, common_values[i]);
         if (target_status == STATUS_SUCCESS)
-            todo_wine ok(!observation->target_status && observation->target_value == target_values[i],
-                    "attachment %s target: status %#lx byte %#x, expected %#x\n", phases[i],
-                    observation->target_status, observation->target_value, target_values[i]);
+        {
+            if (strict_attachment)
+                ok(!observation->target_status && observation->target_value == target_values[i],
+                        "attachment %s target: status %#lx byte %#x, expected %#x\n", phases[i],
+                        observation->target_status, observation->target_value, target_values[i]);
+            else
+                todo_wine ok(!observation->target_status && observation->target_value == target_values[i],
+                        "attachment %s target: status %#lx byte %#x, expected %#x\n", phases[i],
+                        observation->target_status, observation->target_value, target_values[i]);
+        }
         else
             ok(observation->target_status == target_status, "attachment %s target status %#lx\n",
                     phases[i], observation->target_status);
+
+        if (strict_attachment)
+        {
+            ULONG_PTR expected_current_process_id = !i || i == 4 ? input.requestor_process_id
+                    : input.process_id[i == 2 ? 1 : 0];
+            ULONG_PTR expected_current_process;
+            ULONG_PTR expected_kapc_a = i >= 1 && i <= 3 ? output.observations[0].current_process : 0;
+            ULONG_PTR expected_kapc_b = i == 2 ? output.observations[1].current_process : 0;
+
+            expected_current_process = !i || i == 4 ? output.observations[0].current_process
+                    : output.observations[0].process_reference[i == 2 ? 1 : 0];
+            ok(observation->kernel_state == (ATTACHMENT_STATE_GLOBAL | ATTACHMENT_STATE_POOL
+                    | ATTACHMENT_STATE_STACK | ATTACHMENT_STATE_IRP | ATTACHMENT_STATE_SYSTEM_BUFFER
+                    | ATTACHMENT_STATE_PROCESS_REFS | ATTACHMENT_STATE_THREAD
+                    | ATTACHMENT_STATE_KAPC_STORAGE),
+                    "attachment %s kernel-state mask %#lx\n", phases[i], observation->kernel_state);
+            ok(observation->requestor_process_id == input.requestor_process_id,
+                    "attachment %s requestor identity %#Ix expected %#Ix\n", phases[i],
+                    observation->requestor_process_id, input.requestor_process_id);
+            ok(observation->current_process_id == expected_current_process_id,
+                    "attachment %s address-space process id %Iu expected %Iu\n", phases[i],
+                    observation->current_process_id, expected_current_process_id);
+            ok(observation->current_process == expected_current_process,
+                    "attachment %s current process %p expected %p\n", phases[i],
+                    (void *)observation->current_process, (void *)expected_current_process);
+            ok(observation->current_thread_id == output.observations[0].current_thread_id
+                    && observation->current_thread == output.observations[0].current_thread,
+                    "attachment %s logical thread identity changed: id %#Ix/%#Ix object %p/%p\n", phases[i],
+                    observation->current_thread_id, output.observations[0].current_thread_id,
+                    (void *)observation->current_thread, (void *)output.observations[0].current_thread);
+            ok(observation->process_reference[0] && observation->process_reference[1]
+                    && observation->process_reference[0] == output.observations[0].process_reference[0]
+                    && observation->process_reference[1] == output.observations[0].process_reference[1],
+                    "attachment %s referenced processes changed: %p/%p\n", phases[i],
+                    (void *)observation->process_reference[0], (void *)observation->process_reference[1]);
+            ok(observation->kapc_state[0] == output.observations[0].kapc_state[0]
+                    && observation->kapc_state[1] == output.observations[0].kapc_state[1],
+                    "attachment %s KAPC_STATE storage moved: %p/%p\n", phases[i],
+                    (void *)observation->kapc_state[0], (void *)observation->kapc_state[1]);
+            ok(observation->kapc_process[0] == expected_kapc_a
+                    && observation->kapc_process[1] == expected_kapc_b,
+                    "attachment %s KAPC_STATE previous processes %p/%p expected %p/%p\n", phases[i],
+                    (void *)observation->kapc_process[0], (void *)observation->kapc_process[1],
+                    (void *)expected_kapc_a, (void *)expected_kapc_b);
+            ok(observation->irp == output.observations[0].irp
+                    && observation->io_stack == output.observations[0].io_stack
+                    && observation->system_buffer == output.observations[0].system_buffer,
+                    "attachment %s IRP/stack/SystemBuffer changed: %p/%p/%p\n", phases[i],
+                    (void *)observation->irp, (void *)observation->io_stack,
+                    (void *)observation->system_buffer);
+            ok(observation->driver_global == output.observations[0].driver_global
+                    && observation->pool_allocation == output.observations[0].pool_allocation
+                    && observation->stack_local == output.observations[0].stack_local
+                    && observation->stack_cookie == 0x535441434b303031ull,
+                    "attachment %s global/pool/stack state changed: %p/%p/%p cookie %#I64x\n", phases[i],
+                    (void *)observation->driver_global, (void *)observation->pool_allocation,
+                    (void *)observation->stack_local, observation->stack_cookie);
+        }
+    }
+    if (strict_attachment)
+    {
+        ok(output.observations[1].attached_fault_status == STATUS_ACCESS_VIOLATION,
+                "guarded fault after attach A returned %#lx\n", output.observations[1].attached_fault_status);
+        for (i = 0; i < ATTACHMENT_OBSERVATIONS; ++i)
+            if (i != 1)
+                ok(!output.observations[i].attached_fault_status,
+                        "unexpected attached fault status in phase %s: %#lx\n", phases[i],
+                        output.observations[i].attached_fault_status);
+
+        /* This second request leaves an active attachment on an uncaught
+         * driver exception. The runtime dispatch wrapper must unwind it. */
+        input.flags = ATTACHMENT_INPUT_STRICT_STATE | ATTACHMENT_INPUT_RAISE_AFTER_ATTACH;
+        size = 0;
+        ret = DeviceIoControl(device, IOCTL_WINETEST_PROCESS_ATTACHMENT, &input, sizeof(input),
+                &healthy_output, sizeof(healthy_output), &size, NULL);
+        wait = ret ? ERROR_SUCCESS : GetLastError();
+        trace("attached fault IOCTL result %d, error %lu, size %lu\n", ret, wait, size);
+        ok(!ret && wait == ERROR_NOACCESS
+                && wait == RtlNtStatusToDosErrorNoTeb(STATUS_ACCESS_VIOLATION) && !size,
+                "attached fault IOCTL result %d, error %lu expected %lu, size %lu\n", ret, wait,
+                RtlNtStatusToDosErrorNoTeb(STATUS_ACCESS_VIOLATION), size);
+
+        /* A third normal IOCTL proves the uncaught exception cleanup restored
+         * caller state and left the executor able to run the same driver. */
+        input.flags = ATTACHMENT_INPUT_STRICT_STATE;
+        memset(&healthy_output, 0xcc, sizeof(healthy_output));
+        size = 0;
+        ret = DeviceIoControl(device, IOCTL_WINETEST_PROCESS_ATTACHMENT, &input, sizeof(input),
+                &healthy_output, sizeof(healthy_output), &size, NULL);
+        ok(ret && size == sizeof(healthy_output),
+                "post-fault healthy attachment IOCTL failed, result %d size %lu error %lu\n",
+                ret, size, GetLastError());
+        if (ret && size == sizeof(healthy_output))
+            for (i = 0; i < ATTACHMENT_OBSERVATIONS; ++i)
+            {
+                const struct attachment_observation *observation = &healthy_output.observations[i];
+                BOOL target_present = i && i != 4;
+                ULONG_PTR expected_current_process_id = !i || i == 4 ? input.requestor_process_id
+                        : input.process_id[i == 2 ? 1 : 0];
+                ULONG_PTR expected_current_process = !i || i == 4
+                        ? healthy_output.observations[0].current_process
+                        : healthy_output.observations[0].process_reference[i == 2 ? 1 : 0];
+                ULONG_PTR expected_kapc_a = i >= 1 && i <= 3
+                        ? healthy_output.observations[0].current_process : 0;
+                ULONG_PTR expected_kapc_b = i == 2
+                        ? healthy_output.observations[1].current_process : 0;
+                ok(!observation->common_status && observation->common_value == common_values[i],
+                        "post-fault %s common read %#lx/%#x\n", phases[i],
+                        observation->common_status, observation->common_value);
+                if (target_present)
+                    ok(!observation->target_status && observation->target_value == target_values[i],
+                            "post-fault %s target read %#lx/%#x\n", phases[i],
+                            observation->target_status, observation->target_value);
+                else
+                    ok(observation->target_status == STATUS_ACCESS_VIOLATION,
+                            "post-fault %s target read unexpectedly succeeded: %#lx/%#x\n", phases[i],
+                            observation->target_status, observation->target_value);
+                ok(observation->current_process == expected_current_process,
+                        "post-fault %s address-space process %p expected %p\n", phases[i],
+                        (void *)observation->current_process, (void *)expected_current_process);
+                ok(observation->kernel_state == (ATTACHMENT_STATE_GLOBAL | ATTACHMENT_STATE_POOL
+                        | ATTACHMENT_STATE_STACK | ATTACHMENT_STATE_IRP | ATTACHMENT_STATE_SYSTEM_BUFFER
+                        | ATTACHMENT_STATE_PROCESS_REFS | ATTACHMENT_STATE_THREAD
+                        | ATTACHMENT_STATE_KAPC_STORAGE),
+                        "post-fault %s kernel-state mask %#lx\n", phases[i], observation->kernel_state);
+                ok(observation->current_process_id == expected_current_process_id,
+                        "post-fault %s current process id %#Ix\n", phases[i], observation->current_process_id);
+                ok(observation->requestor_process_id == input.requestor_process_id
+                        && observation->current_thread_id == healthy_output.observations[0].current_thread_id
+                        && observation->current_thread == healthy_output.observations[0].current_thread,
+                        "post-fault %s requestor/thread identity changed\n", phases[i]);
+                ok(observation->process_reference[0] == healthy_output.observations[0].process_reference[0]
+                        && observation->process_reference[1] == healthy_output.observations[0].process_reference[1]
+                        && observation->kapc_state[0] == healthy_output.observations[0].kapc_state[0]
+                        && observation->kapc_state[1] == healthy_output.observations[0].kapc_state[1],
+                        "post-fault %s process references/KAPC storage changed\n", phases[i]);
+                ok(observation->kapc_process[0] == expected_kapc_a
+                        && observation->kapc_process[1] == expected_kapc_b,
+                        "post-fault %s KAPC previous processes %p/%p expected %p/%p\n", phases[i],
+                        (void *)observation->kapc_process[0], (void *)observation->kapc_process[1],
+                        (void *)expected_kapc_a, (void *)expected_kapc_b);
+                ok(observation->irp == healthy_output.observations[0].irp
+                        && observation->io_stack == healthy_output.observations[0].io_stack
+                        && observation->system_buffer == healthy_output.observations[0].system_buffer
+                        && observation->driver_global == healthy_output.observations[0].driver_global
+                        && observation->pool_allocation == healthy_output.observations[0].pool_allocation
+                        && observation->stack_local == healthy_output.observations[0].stack_local
+                        && observation->stack_cookie == 0x535441434b303031ull,
+                        "post-fault %s kernel object/storage pointers changed\n", phases[i]);
+            }
     }
     ret = VirtualQuery((void *)shared->target_address, &info, sizeof(info));
     ok(ret && info.State == MEM_FREE, "target-only address no longer absent from caller\n");
@@ -5143,9 +5867,11 @@ static void test_pnp_driver(struct testsign_context *ctx)
 START_TEST(ntoskrnl)
 {
     WCHAR filename[MAX_PATH], filename2[MAX_PATH];
+    const char *attachment_ranges = getenv("WINE_EXPERIMENTAL_ATTACH_RANGES");
+    const char *driver_concurrency = getenv("WINE_EXPERIMENTAL_DRIVER_CONCURRENCY");
     struct testsign_context ctx;
     SC_HANDLE service, service2;
-    BOOL ret, is_wow64;
+    BOOL ret, is_wow64, attachment_only = !!attachment_ranges || !!driver_concurrency;
     HANDLE mapping;
     DWORD written;
     HMODULE cfgmgr32;
@@ -5197,10 +5923,23 @@ START_TEST(ntoskrnl)
         DeleteFileW(filename);
         goto out;
     }
-    service2 = load_driver(&ctx, filename2, L"driver2.dll", L"WineTestDriver2");
 
     device = CreateFileA("\\\\.\\WineTestDriver", 0, 0, NULL, OPEN_EXISTING, 0, NULL);
     ok(device != INVALID_HANDLE_VALUE, "failed to open device: %lu\n", GetLastError());
+
+    if (attachment_only)
+    {
+        test_process_attachment();
+        ret = DeviceIoControl(device, IOCTL_WINETEST_DETACH, NULL, 0, NULL, 0, &written, NULL);
+        ok(ret, "DeviceIoControl failed: %lu\n", GetLastError());
+        CloseHandle(device);
+        unload_driver(service);
+        ret = DeleteFileW(filename);
+        ok(ret, "DeleteFile failed: %lu\n", GetLastError());
+        goto out;
+    }
+
+    service2 = load_driver(&ctx, filename2, L"driver2.dll", L"WineTestDriver2");
 
     test_basic_ioctl();
 

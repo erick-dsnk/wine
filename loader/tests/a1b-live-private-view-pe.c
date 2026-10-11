@@ -34,7 +34,8 @@
 
 enum command { CMD_ALLOC, CMD_READ, CMD_WRITE, CMD_PROTECT, CMD_DECOMMIT,
                CMD_COMMIT, CMD_FREE, CMD_ACQUIRE, CMD_DROP, CMD_LOOP,
-               CMD_LOOP_RESULT, CMD_EXIT, CMD_BEGIN_ACQUIRE, CMD_END_ACQUIRE, CMD_QUERY, CMD_COLLISION_INSTALL, CMD_COLLISION_REMOVE, CMD_MUTATION_BEGIN, CMD_MUTATION_POLL, CMD_MUTATION_WAIT, CMD_OWNER_STATE, CMD_WATCH_NATIVE_PID, CMD_SUSPENDED_CREATE, CMD_SUSPENDED_KILL, CMD_CPU_BARRIER, CMD_NEGATIVE_VM, CMD_DENIED_ACQUIRE, CMD_STALE_QUERY, CMD_CANCEL_BEGIN, CMD_CANCEL_END };
+               CMD_LOOP_RESULT, CMD_EXIT, CMD_BEGIN_ACQUIRE, CMD_END_ACQUIRE, CMD_QUERY, CMD_COLLISION_INSTALL, CMD_COLLISION_REMOVE, CMD_MUTATION_BEGIN, CMD_MUTATION_POLL, CMD_MUTATION_WAIT, CMD_OWNER_STATE, CMD_WATCH_NATIVE_PID, CMD_SUSPENDED_CREATE, CMD_SUSPENDED_KILL, CMD_CPU_BARRIER, CMD_NEGATIVE_VM, CMD_DENIED_ACQUIRE, CMD_STALE_QUERY, CMD_CANCEL_BEGIN, CMD_CANCEL_END,
+               CMD_RAW_ACQUIRE };
 struct packet
 {
     unsigned int command, value, target_pid, status;
@@ -240,6 +241,51 @@ static NTSTATUS denied_acquire( struct packet *packet )
     }
     SERVER_END_REQ;
     CloseHandle( target );
+    return status;
+}
+/* Exercise server admission directly, bypassing acquire_lease()'s local
+ * single-lease guard. If the server admits it, wait for MAP and release it
+ * before restoring the consumer's original local lease bookkeeping. */
+static NTSTATUS drop_lease( struct packet *packet );
+static NTSTATUS raw_acquire( struct packet *packet )
+{
+    struct lease saved = lease;
+    HANDLE target = OpenProcess( PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+                                PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, packet->target_pid );
+    NTSTATUS status;
+    if (!target) return STATUS_INVALID_CID;
+    memset( &lease, 0, sizeof(lease) );
+    SERVER_START_REQ( acquire_private_mapping )
+    {
+        req->process = wine_server_obj_handle( target );
+        req->address = (ULONG_PTR)PROBE_ADDRESS;
+        req->size = PROBE_SIZE;
+        req->access = packet->value;
+        status = wine_server_call( req );
+        if (!status)
+        {
+            lease.handle = wine_server_ptr_handle( reply->handle );
+            lease.ready = wine_server_ptr_handle( reply->ready );
+            lease.token = reply->token;
+            lease.generation = reply->generation;
+            lease.mapping_id = reply->mapping_id;
+        }
+    }
+    SERVER_END_REQ;
+    CloseHandle( target );
+    if (!status)
+    {
+        status = wait_lease( packet );
+        if (!status)
+        {
+            NTSTATUS lease_status = packet->lease_status;
+            NTSTATUS cleanup = drop_lease( packet );
+            if (cleanup) fatal( "cleanup unexpectedly admitted raw lease" );
+            if (lease_status) status = lease_status;
+        }
+        else fatal( "raw lease admission did not reach a bounded terminal state" );
+    }
+    lease = saved;
     return status;
 }
 static NTSTATUS stale_query( unsigned int field )
@@ -476,6 +522,7 @@ static int child_loop( HANDLE pipe )
         case CMD_COLLISION_INSTALL: packet.status = native_helper( 0, (ULONG_PTR)PROBE_ADDRESS, NULL ); break;
         case CMD_COLLISION_REMOVE: packet.status = native_helper( 1, (ULONG_PTR)PROBE_ADDRESS, NULL ); break;
         case CMD_DENIED_ACQUIRE: packet.status = denied_acquire( &packet ); break;
+        case CMD_RAW_ACQUIRE: packet.status = raw_acquire( &packet ); break;
         case CMD_STALE_QUERY: packet.status = stale_query( packet.value ); break;
         case CMD_NEGATIVE_VM: packet.status = negative_alias_vm( packet.value ); break;
         case CMD_CANCEL_BEGIN:
@@ -1228,6 +1275,63 @@ static int backing_disabled_main(void)
     printf( "a1b-live-private-view: %ld checks, %ld failures (backing default-off)\n", checks, failures );
     return !!failures;
 }
+static int lease_concurrency_main(void)
+{
+    struct child target, reader_a, reader_b, contender;
+    struct packet packet;
+    HANDLE observation;
+    char name[128];
+
+    sprintf( name, "a1b-live-view-observation-%lu", GetCurrentProcessId() );
+    observation = CreateFileMappingA( INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+                                     sizeof(*loop_observation), name );
+    if (!observation || !(loop_observation = MapViewOfFile( observation, FILE_MAP_ALL_ACCESS, 0, 0, 0 )))
+        fatal( "create concurrent lease observation" );
+
+    target = spawn_child( "target", 31 );
+    reader_a = spawn_child( "executor", 32 );
+    reader_b = spawn_child( "executor", 33 );
+    contender = spawn_child( "executor", 34 );
+    operation( &target, CMD_ALLOC, 0x5a, "concurrent target allocates private backing" );
+
+    acquire( &reader_a, &target, FILE_READ_DATA );
+    acquire( &reader_b, &target, FILE_READ_DATA );
+    read_value( &reader_a, 0x5a, "first consumer directly reads shared target backing" );
+    read_value( &reader_b, 0x5a, "second consumer directly reads same backing concurrently" );
+
+    packet = request( &reader_a, CMD_RAW_ACQUIRE, FILE_READ_DATA, target.pid );
+    check( packet.status == (unsigned int)STATUS_DEVICE_BUSY,
+           "raw server request rejects duplicate READ lease by same consumer" );
+    read_value( &reader_a, 0x5a, "duplicate request leaves original reader mapping live" );
+    packet = request( &contender, CMD_RAW_ACQUIRE, FILE_WRITE_DATA | FILE_READ_DATA, target.pid );
+    check( packet.status == (unsigned int)STATUS_DEVICE_BUSY,
+           "writer is denied while independent READ leases remain live" );
+
+    drop( &reader_a );
+    read_value( &reader_a, PROBE_FAULT, "released first reader loses its direct alias" );
+    read_value( &reader_b, 0x5a, "second reader remains directly readable after peer release" );
+    drop( &reader_b );
+    read_value( &reader_b, PROBE_FAULT, "final reader release removes its direct alias" );
+
+    acquire( &contender, &target, FILE_READ_DATA | FILE_WRITE_DATA );
+    read_value( &contender, 0x5a, "writer is admitted after final reader drains" );
+    write_value( &contender, 0x6b, 0, "exclusive writer directly updates private backing" );
+    read_value( &target, 0x6b, "target observes exclusive writer update" );
+    packet = request( &reader_a, CMD_RAW_ACQUIRE, FILE_READ_DATA, target.pid );
+    check( packet.status == (unsigned int)STATUS_DEVICE_BUSY,
+           "other consumer READ is denied while writer lease is live" );
+    packet = request( &reader_b, CMD_RAW_ACQUIRE, FILE_READ_DATA | FILE_WRITE_DATA, target.pid );
+    check( packet.status == (unsigned int)STATUS_DEVICE_BUSY,
+           "other consumer WRITE is denied while writer lease is live" );
+
+    drop( &contender );
+    read_value( &target, 0x6b, "writer release preserves committed target contents" );
+    operation( &target, CMD_FREE, 0, "concurrent lease target frees backing after all leases drain" );
+    exit_child( &reader_a ); exit_child( &reader_b ); exit_child( &contender ); exit_child( &target );
+    UnmapViewOfFile( loop_observation ); CloseHandle( observation );
+    printf( "a1b-live-private-view: %ld checks, %ld failures (lease concurrency)\n", checks, failures );
+    return !!failures;
+}
 int main( int argc, char **argv )
 {
     setvbuf( stdout, NULL, _IONBF, 0 );
@@ -1235,6 +1339,7 @@ int main( int argc, char **argv )
     if (argc == 2 && !strcmp( argv[1], "--cancel-map" )) return cancellation_main( 1 );
     if (argc == 2 && !strcmp( argv[1], "--cancel-revoke" )) return cancellation_main( 2 );
     if (argc == 2 && !strcmp( argv[1], "--backing-off" )) return backing_disabled_main();
+    if (argc == 2 && !strcmp( argv[1], "--lease-concurrency" )) return lease_concurrency_main();
     if (argc == 4) return child_main( argv[1], argv[2], argv[3] );
     if (argc != 1) return 2;
     return parent_main();

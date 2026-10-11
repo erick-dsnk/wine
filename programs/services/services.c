@@ -1039,6 +1039,11 @@ found:
         {
             L"WINEBOOTSTRAPMODE",
             L"WINE_SHARED_KERNEL_MEMORY",
+            L"WINE_SHARED_KERNEL_MEMORY_BASE",
+            L"WINE_SHARED_PRIVATE_BACKING",
+            L"WINE_EXPERIMENTAL_DRIVER_EXECUTOR",
+            L"WINE_EXPERIMENTAL_DRIVER_CONCURRENCY",
+            L"WINE_EXPERIMENTAL_ATTACH_RANGES",
             L"PROTON_DISABLE_HIDRAW",
             L"PROTON_ENABLE_HIDRAW",
             L"FEX_APP_DATA_LOCATION",
@@ -1051,13 +1056,17 @@ found:
         {
             for (size_t i = 0; i < ARRAY_SIZE(preserve); i++)
             {
-                if (GetEnvironmentVariableW( preserve[i], buffer, ARRAY_SIZE(buffer) ))
+                DWORD length = GetEnvironmentVariableW( preserve[i], buffer, ARRAY_SIZE(buffer) );
+                if (length && length < ARRAY_SIZE(buffer))
                 {
                     UNICODE_STRING value, name;
+                    NTSTATUS status;
                     RtlInitUnicodeString( &name, preserve[i] );
                     RtlInitUnicodeString( &value, buffer );
-                    RtlSetEnvironmentVariable( (WCHAR **)&environment, &name, &value );
+                    status = RtlSetEnvironmentVariable( (WCHAR **)&environment, &name, &value );
+                    if (status) WINE_ERR("Failed to preserve %s, status %#lx.\n", debugstr_w(preserve[i]), status);
                 }
+                else if (length) WINE_ERR("Value for %s exceeds preservation buffer.\n", debugstr_w(preserve[i]));
             }
         }
         CloseHandle(token);

@@ -40,6 +40,8 @@
 #define IOCTL_WINETEST_COMPLETE_ASYNC           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80e, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_WINETEST_PROCESS_ATTACHMENT       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80f, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_WINETEST_SHARED_KERNEL_MEMORY     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINETEST_CONCURRENT_ATTACHMENT    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINETEST_CONCURRENT_RESET         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define IOCTL_WINETEST_BUS_MAIN             CTL_CODE(FILE_DEVICE_BUS_EXTENDER, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_WINETEST_BUS_REGISTER_IFACE   CTL_CODE(FILE_DEVICE_BUS_EXTENDER, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -86,16 +88,48 @@ struct return_status_params
 struct attachment_input
 {
     DWORD process_id[2];
+    ULONG_PTR requestor_process_id;
     ULONG_PTR common_address;
     ULONG_PTR target_address;
+    DWORD flags;
 };
+
+#define ATTACHMENT_INPUT_STRICT_STATE 0x00000001
+#define ATTACHMENT_INPUT_FAULT_AFTER_ATTACH 0x00000002
+#define ATTACHMENT_INPUT_RAISE_AFTER_ATTACH 0x00000004
+
+#define ATTACHMENT_STATE_GLOBAL       0x00000001
+#define ATTACHMENT_STATE_POOL         0x00000002
+#define ATTACHMENT_STATE_STACK        0x00000004
+#define ATTACHMENT_STATE_IRP          0x00000008
+#define ATTACHMENT_STATE_SYSTEM_BUFFER 0x00000010
+#define ATTACHMENT_STATE_PROCESS_REFS 0x00000020
+#define ATTACHMENT_STATE_THREAD        0x00000040
+#define ATTACHMENT_STATE_KAPC_STORAGE   0x00000080
 
 struct attachment_observation
 {
     NTSTATUS common_status;
     NTSTATUS target_status;
+    NTSTATUS attached_fault_status;
     BYTE common_value;
     BYTE target_value;
+    ULONG kernel_state;
+    ULONG_PTR requestor_process_id;
+    ULONG_PTR current_process_id;
+    ULONG_PTR current_process;
+    ULONG_PTR current_thread_id;
+    ULONG_PTR current_thread;
+    ULONG_PTR process_reference[2];
+    ULONG_PTR kapc_state[2];
+    ULONG_PTR kapc_process[2];
+    ULONG_PTR irp;
+    ULONG_PTR io_stack;
+    ULONG_PTR system_buffer;
+    ULONG_PTR driver_global;
+    ULONG_PTR pool_allocation;
+    ULONG_PTR stack_local;
+    ULONG64 stack_cookie;
 };
 
 struct attachment_output
@@ -105,6 +139,59 @@ struct attachment_output
     NTSTATUS valid_status;
     BYTE valid_value;
     struct attachment_observation observations[ATTACHMENT_OBSERVATIONS];
+};
+
+#define CONCURRENT_ATTACHMENT_PHASES 6
+#define CONCURRENT_ATTACHMENT_BARRIERS 8
+
+#define CONCURRENT_ATTACHMENT_INPUT_FAULT 0x00000001
+
+struct concurrent_attachment_input
+{
+    DWORD process_id[2];
+    ULONG_PTR requestor_process_id;
+    ULONG_PTR requestor_thread_id;
+    ULONG_PTR common_address;
+    ULONG_PTR target_address;
+    DWORD lane;
+    DWORD flags;
+};
+
+struct concurrent_attachment_observation
+{
+    NTSTATUS common_status;
+    NTSTATUS target_status;
+    BYTE common_value;
+    BYTE target_value;
+    ULONG kernel_state;
+    ULONG_PTR requestor_process_id;
+    ULONG_PTR requestor_thread_id;
+    ULONG_PTR current_process_id;
+    ULONG_PTR current_process;
+    ULONG_PTR caller_process;
+    ULONG_PTR current_thread_id;
+    ULONG_PTR current_thread;
+    ULONG_PTR process_reference[2];
+    ULONG_PTR kapc_state;
+    ULONG_PTR kapc_process;
+    ULONG_PTR irp;
+    ULONG_PTR io_stack;
+    ULONG_PTR system_buffer;
+    ULONG_PTR driver_global;
+    ULONG_PTR pool_allocation;
+    ULONG_PTR stack_local;
+    ULONG64 stack_cookie;
+    ULONG64 global_value;
+    ULONG64 pool_value;
+    ULONG read_count;
+};
+
+struct concurrent_attachment_output
+{
+    NTSTATUS lookup_status[2];
+    ULONG barrier_mask;
+    ULONG fault_peer_reads;
+    struct concurrent_attachment_observation observations[CONCURRENT_ATTACHMENT_PHASES];
 };
 
 static const GUID control_class = {0xdeadbeef, 0x29ef, 0x4538, {0xa5, 0xfd, 0xb6, 0x95, 0x73, 0xa3, 0x62, 0xc0}};

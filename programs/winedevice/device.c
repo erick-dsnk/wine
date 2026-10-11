@@ -34,6 +34,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(ntoskrnl);
 static const WCHAR servicesW[] = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\";
 
 extern NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event );
+extern NTSTATUS CDECL wine_ntoskrnl_executor_worker( HANDLE section, void *base, SIZE_T size, void *slot );
 extern void CDECL wine_enumerate_root_devices( const WCHAR *driver_name );
 
 static WCHAR winedeviceW[] = L"winedevice";
@@ -155,6 +156,11 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
     service_table[0].lpServiceProc = ServiceMain;
     service_table[1].lpServiceName = NULL;
     service_table[1].lpServiceProc = NULL;
+
+    if (argc == 6 && !wcscmp( argv[1], L"--wine-driver-executor" ))
+        return wine_ntoskrnl_executor_worker( (HANDLE)(ULONG_PTR)wcstoull( argv[2], NULL, 16 ),
+                (void *)(ULONG_PTR)wcstoull( argv[3], NULL, 16 ),
+                (SIZE_T)wcstoull( argv[4], NULL, 16 ), (void *)(ULONG_PTR)wcstoull( argv[5], NULL, 16 ) );
 
     StartServiceCtrlDispatcherW( service_table );
     return 0;

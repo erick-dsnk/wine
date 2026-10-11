@@ -58,6 +58,15 @@ static int kmemcmp( const void *ptr1, const void *ptr2, size_t n )
 
 static DRIVER_OBJECT *driver_obj;
 static DEVICE_OBJECT *lower_device, *upper_device;
+static volatile ULONGLONG attachment_driver_cookie;
+#if defined(__x86_64__) && defined(__WINE_PE_BUILD)
+static volatile LONG concurrent_attachment_arrivals[CONCURRENT_ATTACHMENT_BARRIERS];
+static volatile LONG concurrent_attachment_failed;
+static volatile LONG concurrent_attachment_pool_state;
+static ULONGLONG *volatile concurrent_attachment_pool;
+static volatile LONG64 concurrent_attachment_global;
+static volatile LONG concurrent_attachment_fault_started;
+#endif
 
 static IRP *queued_async_irps[2];
 static unsigned int queued_async_count;
@@ -3018,13 +3027,104 @@ __ASM_GLOBAL_FUNC(attachment_read_byte,
     ".rva .Lattachment_load_begin,.Lattachment_load_end,attachment_exception_filter,.Lattachment_recover\n\t"
     ".text");
 
-static void observe_attachment(const struct attachment_input *input,
-        struct attachment_observation *observation)
+struct attachment_probe_context
 {
-    observation->common_status = attachment_read_byte((void *)input->common_address,
-            &observation->common_value);
-    observation->target_status = attachment_read_byte((void *)input->target_address,
-            &observation->target_value);
+    IRP *irp;
+    IO_STACK_LOCATION *io_stack;
+    void *system_buffer;
+    PEPROCESS caller_process;
+    PKTHREAD thread;
+    PEPROCESS processes[2];
+    ULONGLONG *pool_cookie;
+    volatile ULONGLONG *stack_cookie;
+    ULONGLONG *kapc_guard[2][2];
+};
+
+struct attachment_state_frame
+{
+    ULONGLONG before;
+    KAPC_STATE state;
+    ULONGLONG after;
+};
+
+static void observe_attachment(const struct attachment_input *input,
+        struct attachment_observation *observation, struct attachment_probe_context *context,
+        KAPC_STATE *state_a, KAPC_STATE *state_b, unsigned int depth)
+{
+    PEPROCESS current_process = PsGetCurrentProcess();
+    PKTHREAD current_thread = KeGetCurrentThread();
+    struct attachment_input *system_input = context->system_buffer;
+    ULONG state = 0;
+
+    if (input->flags & ATTACHMENT_INPUT_STRICT_STATE)
+    {
+        /* The opt-in contract probe uses ordinary compiler-generated loads
+         * in each admitted address space; only the deliberately absent caller
+         * mapping uses the guarded helper. */
+        observation->common_value = *(volatile BYTE *)(ULONG_PTR)input->common_address;
+        observation->common_status = STATUS_SUCCESS;
+        if (depth)
+        {
+            observation->target_value = *(volatile BYTE *)(ULONG_PTR)input->target_address;
+            observation->target_status = STATUS_SUCCESS;
+        }
+        else
+            observation->target_status = attachment_read_byte((void *)input->target_address,
+                    &observation->target_value);
+    }
+    else
+    {
+        observation->common_status = attachment_read_byte((void *)input->common_address,
+                &observation->common_value);
+        observation->target_status = attachment_read_byte((void *)input->target_address,
+                &observation->target_value);
+    }
+    observation->requestor_process_id = (ULONG_PTR)PsGetCurrentProcessId();
+    observation->current_process_id = (ULONG_PTR)PsGetProcessId(current_process);
+    observation->current_process = (ULONG_PTR)current_process;
+    observation->current_thread_id = (ULONG_PTR)PsGetCurrentThreadId();
+    observation->current_thread = (ULONG_PTR)current_thread;
+    observation->process_reference[0] = (ULONG_PTR)context->processes[0];
+    observation->process_reference[1] = (ULONG_PTR)context->processes[1];
+    observation->kapc_state[0] = (ULONG_PTR)state_a;
+    observation->kapc_state[1] = (ULONG_PTR)state_b;
+    if (depth >= 1) observation->kapc_process[0] = (ULONG_PTR)state_a->Process;
+    if (depth >= 2) observation->kapc_process[1] = (ULONG_PTR)state_b->Process;
+    observation->irp = (ULONG_PTR)context->irp;
+    observation->io_stack = (ULONG_PTR)IoGetCurrentIrpStackLocation(context->irp);
+    observation->system_buffer = (ULONG_PTR)context->system_buffer;
+    observation->driver_global = (ULONG_PTR)&attachment_driver_cookie;
+    observation->pool_allocation = (ULONG_PTR)context->pool_cookie;
+    if (context->stack_cookie)
+    {
+        observation->stack_local = (ULONG_PTR)context->stack_cookie;
+        observation->stack_cookie = *context->stack_cookie;
+    }
+
+    if (attachment_driver_cookie == 0x474c4f42414c3031ull) state |= ATTACHMENT_STATE_GLOBAL;
+    if (context->pool_cookie && *context->pool_cookie == 0x504f4f4c434f4f4bull) state |= ATTACHMENT_STATE_POOL;
+    if (context->stack_cookie && *context->stack_cookie == 0x535441434b303031ull) state |= ATTACHMENT_STATE_STACK;
+    if (context->irp && IoGetCurrentIrpStackLocation(context->irp) == context->io_stack
+            && context->irp->AssociatedIrp.SystemBuffer == context->system_buffer)
+        state |= ATTACHMENT_STATE_IRP;
+    if (system_input->requestor_process_id == input->requestor_process_id
+            && system_input->common_address == input->common_address
+            && system_input->target_address == input->target_address)
+        state |= ATTACHMENT_STATE_SYSTEM_BUFFER;
+    if (context->processes[0] && context->processes[1]
+            && PsGetProcessId(context->processes[0]) == (HANDLE)(ULONG_PTR)input->process_id[0]
+            && PsGetProcessId(context->processes[1]) == (HANDLE)(ULONG_PTR)input->process_id[1])
+        state |= ATTACHMENT_STATE_PROCESS_REFS;
+    if ((ULONG_PTR)PsGetCurrentProcessId() == input->requestor_process_id
+            && current_thread == context->thread
+            && (ULONG_PTR)PsGetCurrentThreadId() == (ULONG_PTR)PsGetThreadId((PETHREAD)context->thread))
+        state |= ATTACHMENT_STATE_THREAD;
+    if (*context->kapc_guard[0][0] == 0x4b41504347554131ull
+            && *context->kapc_guard[0][1] == 0x4b41504347554132ull
+            && *context->kapc_guard[1][0] == 0x4b41504347554231ull
+            && *context->kapc_guard[1][1] == 0x4b41504347554232ull)
+        state |= ATTACHMENT_STATE_KAPC_STORAGE;
+    observation->kernel_state = state;
 }
 #endif
 
@@ -3033,39 +3133,95 @@ static NTSTATUS test_process_attachment(IRP *irp, IO_STACK_LOCATION *stack)
 #if defined(__x86_64__) && defined(__WINE_PE_BUILD)
     struct attachment_input input;
     struct attachment_output output = {0};
+    struct attachment_probe_context context = {0};
     PEPROCESS processes[2] = {NULL, NULL};
-    KAPC_STATE state_a, state_b;
+    struct attachment_state_frame state_a, state_b;
     BYTE value = 0x7e;
+    ULONGLONG *pool_cookie = NULL;
+    volatile ULONGLONG stack_cookie = 0;
+    BOOL strict_state;
     unsigned int i;
+    NTSTATUS status;
 
     if (stack->Parameters.DeviceIoControl.InputBufferLength != sizeof(input)
             || stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(output))
         return STATUS_BUFFER_TOO_SMALL;
     input = *(struct attachment_input *)irp->AssociatedIrp.SystemBuffer;
+    strict_state = !!(input.flags & ATTACHMENT_INPUT_STRICT_STATE);
+    if (input.flags & ATTACHMENT_INPUT_RAISE_AFTER_ATTACH)
+    {
+        KAPC_STATE fault_state;
+        PEPROCESS fault_process;
+        HANDLE attached_process_id, expected_process_id;
+
+        status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)input.process_id[0], &fault_process);
+        if (status) return status;
+        KeStackAttachProcess((PKPROCESS)fault_process, &fault_state);
+        attached_process_id = PsGetProcessId(PsGetCurrentProcess());
+        expected_process_id = (HANDLE)(ULONG_PTR)input.process_id[0];
+        ObDereferenceObject(fault_process);
+        trace("E05 uncaught-fault checkpoint: attached process %p, expected %p, raising %#lx\n",
+                attached_process_id, expected_process_id, STATUS_ACCESS_VIOLATION);
+        if (attached_process_id != expected_process_id) RtlRaiseStatus(STATUS_INVALID_DEVICE_STATE);
+        RtlRaiseStatus(STATUS_ACCESS_VIOLATION);
+        return STATUS_ACCESS_VIOLATION;
+    }
     output.valid_status = attachment_read_byte(&value, &output.valid_value);
     output.fault_status = attachment_read_byte(NULL, &value);
     for (i = 0; i < 2; ++i)
         output.lookup_status[i] = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)input.process_id[i],
                 &processes[i]);
 
+    context.irp = irp;
+    context.io_stack = stack;
+    context.system_buffer = irp->AssociatedIrp.SystemBuffer;
+    context.caller_process = PsGetCurrentProcess();
+    context.thread = KeGetCurrentThread();
+    context.processes[0] = processes[0];
+    context.processes[1] = processes[1];
+    context.stack_cookie = strict_state ? &stack_cookie : NULL;
+    context.kapc_guard[0][0] = &state_a.before;
+    context.kapc_guard[0][1] = &state_a.after;
+    context.kapc_guard[1][0] = &state_b.before;
+    context.kapc_guard[1][1] = &state_b.after;
+
+    if (strict_state && !output.lookup_status[0] && !output.lookup_status[1])
+    {
+        pool_cookie = ExAllocatePoolWithTag(NonPagedPool, sizeof(*pool_cookie), 0x45544135);
+        if (pool_cookie) *pool_cookie = 0x504f4f4c434f4f4bull;
+        attachment_driver_cookie = 0x474c4f42414c3031ull;
+        stack_cookie = 0x535441434b303031ull;
+        context.pool_cookie = pool_cookie;
+        memset(&state_a, 0, sizeof(state_a));
+        memset(&state_b, 0, sizeof(state_b));
+    }
+    state_a.before = 0x4b41504347554131ull;
+    state_a.after = 0x4b41504347554132ull;
+    state_b.before = 0x4b41504347554231ull;
+    state_b.after = 0x4b41504347554232ull;
+
     if (!output.valid_status && output.valid_value == 0x7e
             && output.fault_status == STATUS_ACCESS_VIOLATION
             && !output.lookup_status[0] && !output.lookup_status[1])
     {
-        observe_attachment(&input, &output.observations[0]);
-        KeStackAttachProcess((PKPROCESS)processes[0], &state_a);
-        observe_attachment(&input, &output.observations[1]);
-        KeStackAttachProcess((PKPROCESS)processes[1], &state_b);
-        observe_attachment(&input, &output.observations[2]);
-        KeUnstackDetachProcess(&state_b);
-        observe_attachment(&input, &output.observations[3]);
-        KeUnstackDetachProcess(&state_a);
-        observe_attachment(&input, &output.observations[4]);
+        observe_attachment(&input, &output.observations[0], &context, &state_a.state, &state_b.state, 0);
+        KeStackAttachProcess((PKPROCESS)processes[0], &state_a.state);
+        observe_attachment(&input, &output.observations[1], &context, &state_a.state, &state_b.state, 1);
+        if (input.flags & ATTACHMENT_INPUT_FAULT_AFTER_ATTACH)
+            output.observations[1].attached_fault_status = attachment_read_byte(
+                    (void *)(input.target_address + 0x10000), &value);
+        KeStackAttachProcess((PKPROCESS)processes[1], &state_b.state);
+        observe_attachment(&input, &output.observations[2], &context, &state_a.state, &state_b.state, 2);
+        KeUnstackDetachProcess(&state_b.state);
+        observe_attachment(&input, &output.observations[3], &context, &state_a.state, &state_b.state, 1);
+        KeUnstackDetachProcess(&state_a.state);
+        observe_attachment(&input, &output.observations[4], &context, &state_a.state, &state_b.state, 0);
     }
     /* No assertion, logging, allocation or I/O is performed while attached.
      * Each guarded read returns normally even after an access violation. */
     for (i = 0; i < 2; ++i)
         if (processes[i]) ObDereferenceObject(processes[i]);
+    if (pool_cookie) ExFreePoolWithTag(pool_cookie, 0x45544135);
     *(struct attachment_output *)irp->AssociatedIrp.SystemBuffer = output;
     irp->IoStatus.Information = sizeof(output);
     return STATUS_SUCCESS;
@@ -3073,6 +3229,368 @@ static NTSTATUS test_process_attachment(IRP *irp, IO_STACK_LOCATION *stack)
     return STATUS_NOT_SUPPORTED;
 #endif
 }
+
+#if defined(__x86_64__) && defined(__WINE_PE_BUILD)
+static BOOL concurrent_attachment_wait_value(volatile LONG64 *address, LONG64 expected)
+{
+    LARGE_INTEGER delay;
+    unsigned int i;
+
+    delay.QuadPart = -10000;
+    for (i = 0; i < 5000; ++i)
+    {
+        if (InterlockedCompareExchange64(address, 0, 0) == expected) return TRUE;
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+    InterlockedExchange(&concurrent_attachment_failed, 1);
+    return FALSE;
+}
+
+static ULONGLONG concurrent_attachment_exchange64(volatile LONG64 *address, ULONGLONG value)
+{
+    LONG64 previous = InterlockedCompareExchange64(address, 0, 0), observed;
+
+    do
+    {
+        observed = InterlockedCompareExchange64(address, value, previous);
+        if (observed == previous) return previous;
+        previous = observed;
+    } while (TRUE);
+}
+
+static BOOL concurrent_attachment_wait_count(volatile LONG *address, LONG expected)
+{
+    LARGE_INTEGER delay;
+    unsigned int i;
+
+    delay.QuadPart = -10000;
+    for (i = 0; i < 5000; ++i)
+    {
+        if (InterlockedCompareExchange(address, 0, 0) == expected) return TRUE;
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+    InterlockedExchange(&concurrent_attachment_failed, 1);
+    return FALSE;
+}
+
+static BOOL concurrent_attachment_barrier(struct concurrent_attachment_output *output, unsigned int barrier)
+{
+    LARGE_INTEGER delay;
+    unsigned int i;
+    LONG arrivals;
+
+    if (barrier >= CONCURRENT_ATTACHMENT_BARRIERS) return FALSE;
+    arrivals = InterlockedIncrement(&concurrent_attachment_arrivals[barrier]);
+    if (arrivals > 2) InterlockedExchange(&concurrent_attachment_failed, 1);
+    delay.QuadPart = -10000;
+    for (i = 0; i < 5000; ++i)
+    {
+        arrivals = InterlockedCompareExchange(&concurrent_attachment_arrivals[barrier], 0, 0);
+        if (arrivals == 2 && !InterlockedCompareExchange(&concurrent_attachment_failed, 0, 0))
+        {
+            output->barrier_mask |= 1u << barrier;
+            return TRUE;
+        }
+        if (InterlockedCompareExchange(&concurrent_attachment_failed, 0, 0)) return FALSE;
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+    InterlockedExchange(&concurrent_attachment_failed, 1);
+    return FALSE;
+}
+
+static ULONGLONG *concurrent_attachment_get_pool(void)
+{
+    LARGE_INTEGER delay;
+    LONG state;
+    unsigned int i;
+
+    state = InterlockedCompareExchange(&concurrent_attachment_pool_state, 1, 0);
+    if (!state)
+    {
+        ULONGLONG *pool = ExAllocatePoolWithTag(NonPagedPool, sizeof(*pool), 0x45434f4e);
+        if (pool)
+        {
+            *pool = 0x504f4f4c434f4f4bull;
+            concurrent_attachment_pool = pool;
+            InterlockedExchange(&concurrent_attachment_pool_state, 2);
+            return pool;
+        }
+        InterlockedExchange(&concurrent_attachment_pool_state, 3);
+        return NULL;
+    }
+
+    delay.QuadPart = -10000;
+    for (i = 0; i < 5000; ++i)
+    {
+        state = InterlockedCompareExchange(&concurrent_attachment_pool_state, 0, 0);
+        if (state == 2) return concurrent_attachment_pool;
+        if (state == 3) return NULL;
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+    return NULL;
+}
+
+static void observe_concurrent_attachment(const struct concurrent_attachment_input *input,
+        struct concurrent_attachment_observation *observation, IRP *irp, IO_STACK_LOCATION *stack,
+        struct concurrent_attachment_input *system_input, PEPROCESS *processes,
+        PEPROCESS caller_process, KAPC_STATE *kapc_state, ULONGLONG *pool, volatile ULONGLONG *stack_cookie,
+        PKTHREAD thread, BOOL attached, ULONG read_count)
+{
+    PEPROCESS current_process = PsGetCurrentProcess();
+    PKTHREAD current_thread = KeGetCurrentThread();
+    ULONG state = 0;
+
+    observation->common_value = *(volatile BYTE *)input->common_address;
+    observation->common_status = STATUS_SUCCESS;
+    if (attached)
+    {
+        observation->target_value = *(volatile BYTE *)input->target_address;
+        observation->target_status = STATUS_SUCCESS;
+    }
+    else
+        observation->target_status = attachment_read_byte((void *)input->target_address,
+                &observation->target_value);
+    observation->requestor_process_id = (ULONG_PTR)PsGetCurrentProcessId();
+    observation->requestor_thread_id = (ULONG_PTR)PsGetCurrentThreadId();
+    observation->current_process_id = (ULONG_PTR)PsGetProcessId(current_process);
+    observation->current_process = (ULONG_PTR)current_process;
+    observation->caller_process = (ULONG_PTR)caller_process;
+    observation->current_thread_id = (ULONG_PTR)PsGetCurrentThreadId();
+    observation->current_thread = (ULONG_PTR)current_thread;
+    observation->process_reference[0] = (ULONG_PTR)processes[0];
+    observation->process_reference[1] = (ULONG_PTR)processes[1];
+    observation->kapc_state = (ULONG_PTR)kapc_state;
+    if (attached) observation->kapc_process = (ULONG_PTR)kapc_state->Process;
+    observation->irp = (ULONG_PTR)irp;
+    observation->io_stack = (ULONG_PTR)IoGetCurrentIrpStackLocation(irp);
+    observation->system_buffer = (ULONG_PTR)irp->AssociatedIrp.SystemBuffer;
+    observation->driver_global = (ULONG_PTR)&concurrent_attachment_global;
+    observation->pool_allocation = (ULONG_PTR)pool;
+    observation->stack_local = (ULONG_PTR)stack_cookie;
+    observation->stack_cookie = *stack_cookie;
+    observation->global_value = InterlockedCompareExchange64(&concurrent_attachment_global, 0, 0);
+    observation->pool_value = pool ? InterlockedCompareExchange64((volatile LONG64 *)pool, 0, 0) : 0;
+    observation->read_count = read_count;
+
+    if (attachment_driver_cookie == 0x474c4f42414c3031ull) state |= ATTACHMENT_STATE_GLOBAL;
+    if (pool && (*pool == 0x504f4f4c434f4f4bull || *pool == 0x504f4f4c41303031ull
+            || *pool == 0x504f4f4c42303031ull)) state |= ATTACHMENT_STATE_POOL;
+    if (*stack_cookie == 0x434f4e435354414bull) state |= ATTACHMENT_STATE_STACK;
+    if (irp && IoGetCurrentIrpStackLocation(irp) == stack
+            && irp->AssociatedIrp.SystemBuffer == system_input)
+        state |= ATTACHMENT_STATE_IRP;
+    if (system_input->requestor_process_id == input->requestor_process_id
+            && system_input->common_address == input->common_address
+            && system_input->target_address == input->target_address
+            && system_input->lane == input->lane
+            && system_input->requestor_thread_id == input->requestor_thread_id)
+        state |= ATTACHMENT_STATE_SYSTEM_BUFFER;
+    if (processes[0] && processes[1]
+            && PsGetProcessId(processes[0]) == (HANDLE)(ULONG_PTR)input->process_id[0]
+            && PsGetProcessId(processes[1]) == (HANDLE)(ULONG_PTR)input->process_id[1])
+        state |= ATTACHMENT_STATE_PROCESS_REFS;
+    if ((ULONG_PTR)PsGetCurrentProcessId() == input->requestor_process_id
+            && (ULONG_PTR)PsGetCurrentThreadId() == input->requestor_thread_id
+            && current_thread == thread
+            && (ULONG_PTR)PsGetCurrentThreadId() == (ULONG_PTR)PsGetThreadId((PETHREAD)current_thread))
+        state |= ATTACHMENT_STATE_THREAD;
+    if (kapc_state && (!attached || kapc_state->Process == caller_process))
+        state |= ATTACHMENT_STATE_KAPC_STORAGE;
+    observation->kernel_state = state;
+}
+
+static NTSTATUS reset_concurrent_attachment(void)
+{
+    unsigned int i;
+
+    if (concurrent_attachment_pool) ExFreePoolWithTag(concurrent_attachment_pool, 0x45434f4e);
+    concurrent_attachment_pool = NULL;
+    concurrent_attachment_pool_state = 0;
+    concurrent_attachment_global = 0;
+    concurrent_attachment_failed = 0;
+    concurrent_attachment_fault_started = 0;
+    for (i = 0; i < CONCURRENT_ATTACHMENT_BARRIERS; ++i) concurrent_attachment_arrivals[i] = 0;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS test_concurrent_attachment(IRP *irp, IO_STACK_LOCATION *stack)
+{
+    LARGE_INTEGER delay;
+    struct concurrent_attachment_input input;
+    struct concurrent_attachment_output output = {0};
+    struct concurrent_attachment_input *system_input = irp->AssociatedIrp.SystemBuffer;
+    PEPROCESS processes[2] = {NULL, NULL};
+    KAPC_STATE kapc_state;
+    PEPROCESS caller_process = PsGetCurrentProcess();
+    volatile ULONGLONG stack_cookie = 0x434f4e435354414bull;
+    PKTHREAD thread = KeGetCurrentThread();
+    ULONGLONG *pool;
+    unsigned int i, reads;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (stack->Parameters.DeviceIoControl.InputBufferLength != sizeof(input)
+            || stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(output))
+        return STATUS_BUFFER_TOO_SMALL;
+    input = *system_input;
+    memset(&kapc_state, 0, sizeof(kapc_state));
+    if (input.lane > 1 || input.flags & ~CONCURRENT_ATTACHMENT_INPUT_FAULT)
+        return STATUS_INVALID_PARAMETER;
+    for (i = 0; i < 2; ++i)
+    {
+        output.lookup_status[i] = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)input.process_id[i], &processes[i]);
+        if (output.lookup_status[i]) { status = output.lookup_status[i]; goto done; }
+    }
+    pool = concurrent_attachment_get_pool();
+    if (!pool) { status = STATUS_INSUFFICIENT_RESOURCES; goto done; }
+    attachment_driver_cookie = 0x474c4f42414c3031ull;
+    if (!concurrent_attachment_barrier(&output, 0)) { status = STATUS_TIMEOUT; goto done; }
+
+    KeStackAttachProcess((PKPROCESS)processes[input.lane], &kapc_state);
+    observe_concurrent_attachment(&input, &output.observations[0], irp, stack, system_input,
+            processes, caller_process, &kapc_state, pool, &stack_cookie, thread, TRUE, 0);
+    if (!concurrent_attachment_barrier(&output, 1))
+    {
+        KeUnstackDetachProcess(&kapc_state);
+        status = STATUS_TIMEOUT;
+        goto done;
+    }
+
+    if (input.flags & CONCURRENT_ATTACHMENT_INPUT_FAULT)
+    {
+        if (!input.lane)
+        {
+            for (i = 0; i < 2; ++i)
+            {
+                ObDereferenceObject(processes[i]);
+                processes[i] = NULL;
+            }
+            InterlockedExchange(&concurrent_attachment_fault_started, 1);
+            RtlRaiseStatus(STATUS_ACCESS_VIOLATION);
+            status = STATUS_ACCESS_VIOLATION;
+            KeUnstackDetachProcess(&kapc_state);
+            goto done;
+        }
+        delay.QuadPart = -10000;
+        for (reads = 0; reads < 5000; ++reads)
+        {
+            BYTE common_value = *(volatile BYTE *)input.common_address;
+            BYTE target_value = *(volatile BYTE *)input.target_address;
+            if (common_value != 0xb2 || target_value != 0xd4)
+                InterlockedExchange(&concurrent_attachment_failed, 1);
+            if (InterlockedCompareExchange(&concurrent_attachment_fault_started, 0, 0))
+                ++output.fault_peer_reads;
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
+        observe_concurrent_attachment(&input, &output.observations[1], irp, stack, system_input,
+                processes, caller_process, &kapc_state, pool, &stack_cookie, thread, TRUE,
+                output.fault_peer_reads);
+        KeUnstackDetachProcess(&kapc_state);
+        status = InterlockedCompareExchange(&concurrent_attachment_failed, 0, 0)
+                ? STATUS_DATA_ERROR : STATUS_SUCCESS;
+        goto done;
+    }
+
+    if (!input.lane)
+    {
+        concurrent_attachment_exchange64((volatile LONG64 *)pool, 0x504f4f4c41303031ll);
+        concurrent_attachment_exchange64(&concurrent_attachment_global, 0x474c4f42414c4131ll);
+    }
+    else if (!concurrent_attachment_wait_value(&concurrent_attachment_global, 0x474c4f42414c4131ll)
+            || InterlockedCompareExchange64((volatile LONG64 *)pool, 0, 0) != 0x504f4f4c41303031ll)
+    {
+        InterlockedExchange(&concurrent_attachment_failed, 1);
+    }
+    if (input.lane)
+    {
+        concurrent_attachment_exchange64((volatile LONG64 *)pool, 0x504f4f4c42303031ll);
+        concurrent_attachment_exchange64(&concurrent_attachment_global, 0x474c4f42414c4231ll);
+    }
+    else if (!concurrent_attachment_wait_value(&concurrent_attachment_global, 0x474c4f42414c4231ll)
+            || InterlockedCompareExchange64((volatile LONG64 *)pool, 0, 0) != 0x504f4f4c42303031ll)
+    {
+        InterlockedExchange(&concurrent_attachment_failed, 1);
+    }
+    if (!concurrent_attachment_barrier(&output, 2)) { status = STATUS_TIMEOUT; goto detach_done; }
+    observe_concurrent_attachment(&input, &output.observations[0], irp, stack, system_input,
+            processes, caller_process, &kapc_state, pool, &stack_cookie, thread, TRUE, 0);
+
+    if (!input.lane)
+    {
+        KeUnstackDetachProcess(&kapc_state);
+        observe_concurrent_attachment(&input, &output.observations[1], irp, stack, system_input,
+                processes, caller_process, &kapc_state, pool, &stack_cookie, thread, FALSE, 0);
+        if (!concurrent_attachment_barrier(&output, 3)) { status = STATUS_TIMEOUT; goto done; }
+        KeStackAttachProcess((PKPROCESS)processes[1], &kapc_state);
+    }
+    else
+    {
+        if (!concurrent_attachment_wait_count(&concurrent_attachment_arrivals[3], 1))
+            { status = STATUS_TIMEOUT; goto detach_done; }
+        delay.QuadPart = -10000;
+        for (reads = 0; reads < 64; ++reads)
+        {
+            if (*(volatile BYTE *)input.common_address != 0xb2
+                    || *(volatile BYTE *)input.target_address != 0xd4)
+                InterlockedExchange(&concurrent_attachment_failed, 1);
+            ++output.observations[0].read_count;
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
+        observe_concurrent_attachment(&input, &output.observations[1], irp, stack, system_input,
+                processes, caller_process, &kapc_state, pool, &stack_cookie, thread, TRUE, 64);
+        if (!concurrent_attachment_barrier(&output, 3)) { status = STATUS_TIMEOUT; goto detach_done; }
+    }
+    observe_concurrent_attachment(&input, &output.observations[2], irp, stack, system_input,
+            processes, caller_process, &kapc_state, pool, &stack_cookie, thread, TRUE, output.observations[0].read_count);
+    if (!concurrent_attachment_barrier(&output, 4)) { status = STATUS_TIMEOUT; goto detach_done; }
+
+    if (input.lane)
+    {
+        KeUnstackDetachProcess(&kapc_state);
+        observe_concurrent_attachment(&input, &output.observations[3], irp, stack, system_input,
+                processes, caller_process, &kapc_state, pool, &stack_cookie, thread, FALSE, 0);
+        if (!concurrent_attachment_barrier(&output, 5)) { status = STATUS_TIMEOUT; goto done; }
+        KeStackAttachProcess((PKPROCESS)processes[0], &kapc_state);
+    }
+    else
+    {
+        if (!concurrent_attachment_wait_count(&concurrent_attachment_arrivals[5], 1))
+            { status = STATUS_TIMEOUT; goto detach_done; }
+        delay.QuadPart = -10000;
+        for (reads = 0; reads < 64; ++reads)
+        {
+            if (*(volatile BYTE *)input.common_address != 0xb2
+                    || *(volatile BYTE *)input.target_address != 0xd4)
+                InterlockedExchange(&concurrent_attachment_failed, 1);
+            ++output.observations[2].read_count;
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
+        observe_concurrent_attachment(&input, &output.observations[3], irp, stack, system_input,
+                processes, caller_process, &kapc_state, pool, &stack_cookie, thread, TRUE, 64);
+        if (!concurrent_attachment_barrier(&output, 5)) { status = STATUS_TIMEOUT; goto detach_done; }
+    }
+    observe_concurrent_attachment(&input, &output.observations[4], irp, stack, system_input,
+            processes, caller_process, &kapc_state, pool, &stack_cookie, thread, TRUE, 0);
+    if (!concurrent_attachment_barrier(&output, 6)) { status = STATUS_TIMEOUT; goto detach_done; }
+
+    KeUnstackDetachProcess(&kapc_state);
+    observe_concurrent_attachment(&input, &output.observations[5], irp, stack, system_input,
+            processes, caller_process, &kapc_state, pool, &stack_cookie, thread, FALSE, 0);
+    if (!concurrent_attachment_barrier(&output, 7)) { status = STATUS_TIMEOUT; goto done; }
+    if (InterlockedCompareExchange(&concurrent_attachment_failed, 0, 0)) status = STATUS_DATA_ERROR;
+    goto done;
+
+detach_done:
+    KeUnstackDetachProcess(&kapc_state);
+done:
+    for (i = 0; i < 2; ++i) if (processes[i]) ObDereferenceObject(processes[i]);
+    if (status == STATUS_SUCCESS)
+    {
+        *(struct concurrent_attachment_output *)irp->AssociatedIrp.SystemBuffer = output;
+        irp->IoStatus.Information = sizeof(output);
+    }
+    return status;
+}
+#endif
 
 static void test_permanence(void)
 {
@@ -3503,6 +4021,20 @@ static NTSTATUS WINAPI driver_IoControl(DEVICE_OBJECT *device, IRP *irp)
             break;
         case IOCTL_WINETEST_PROCESS_ATTACHMENT:
             status = test_process_attachment(irp, stack);
+            break;
+        case IOCTL_WINETEST_CONCURRENT_RESET:
+#if defined(__x86_64__) && defined(__WINE_PE_BUILD)
+            status = reset_concurrent_attachment();
+#else
+            status = STATUS_NOT_SUPPORTED;
+#endif
+            break;
+        case IOCTL_WINETEST_CONCURRENT_ATTACHMENT:
+#if defined(__x86_64__) && defined(__WINE_PE_BUILD)
+            status = test_concurrent_attachment(irp, stack);
+#else
+            status = STATUS_NOT_SUPPORTED;
+#endif
             break;
         case IOCTL_WINETEST_SHARED_KERNEL_MEMORY:
             test_shared_kernel_memory(irp, device);

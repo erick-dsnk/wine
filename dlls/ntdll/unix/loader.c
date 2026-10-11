@@ -604,17 +604,28 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info 
     const char *ld_preload = getenv( "LD_PRELOAD" );
     char preloader_reserve[64], socket_env[64];
 
-    /* Admission persists even if Windows code later edits its environment. */
+    /* Admission persists even if Windows code later edits its environment.
+     * The driver experiment assigns the disjoint physical host only to
+     * winedevice; its clients and any children stay in the TARGET domain. */
     if (virtual_is_managed_target() || virtual_is_managed_executor())
     {
+        const char *experiment = getenv( "WINE_EXPERIMENTAL_DRIVER_EXECUTOR" );
         const char *setting = virtual_is_managed_executor() ?
             WINE_MANAGED_EXECUTOR_SETTING : WINE_MANAGED_LAYOUT_SETTING;
 
+        if (experiment && !strcmp( experiment, "1" ))
+        {
+            const char *name = argv[2], *p;
+
+            if (!name) return STATUS_INVALID_PARAMETER;
+            for (p = name; *p; p++) if (*p == '\\' || *p == '/') name = p + 1;
+            setting = !strcasecmp( name, "winedevice.exe" ) ?
+                WINE_MANAGED_EXECUTOR_SETTING : WINE_MANAGED_LAYOUT_SETTING;
+        }
         if (machine != IMAGE_FILE_MACHINE_AMD64) return STATUS_NOT_SUPPORTED;
         if (setenv( "WINE_MANAGED_LAYOUT", setting, 1 )) return STATUS_NO_MEMORY;
-        /* The child's ordinary PE image will relocate into its physical host
-         * domain; its original preferred guest base is not a startup slot. */
-        if (virtual_is_managed_executor()) res_start = res_end = 0;
+        /* A preferred guest base is never an executor startup slot. */
+        if (!strcmp( setting, WINE_MANAGED_EXECUTOR_SETTING )) res_start = res_end = 0;
     }
 
     if (pe_info->wine_fakedll) res_start = res_end = 0;
@@ -1452,6 +1463,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     steamclient_setup_trampolines,
     debugstr_pc,
     unixcall_compat_wine_nt_to_unix_file_name,
+    unixcall_map_shared_driver_image,
 };
 
 
