@@ -410,8 +410,8 @@ static NTSTATUS managed_view_bounds( enum managed_view_purpose purpose, void *ba
     }
     else if (managed_target && purpose == MANAGED_VIEW_ORDINARY)
     {
-        start = WINE_MANAGED_GUEST_START;
-        end = WINE_MANAGED_GUEST_END;
+        start = (ULONG_PTR)WINE_MANAGED_GUEST_START;
+        end = (ULONG_PTR)WINE_MANAGED_GUEST_END;
     }
     else return purpose == MANAGED_VIEW_ORDINARY ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
 
@@ -2424,7 +2424,7 @@ static NTSTATUS install_private_backing( struct file_view *view )
     if (status) goto failed;
     view->private_backing = backing;
     TRACE( "private backing %p base %p size %lx generation %s\n", backing->handle, view->base,
-           view->size, wine_dbgstr_longlong( backing->generation ) );
+           (unsigned long)view->size, wine_dbgstr_longlong( backing->generation ) );
     return STATUS_SUCCESS;
 
 failed:
@@ -2881,7 +2881,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
     }
     else
     {
-        void *start = managed_executor ? (void *)executor_layout.ntdll_end : address_space_start;
+        void *start = managed_executor ? (void *)(ULONG_PTR)executor_layout.ntdll_end : address_space_start;
         void *end = min( effective_user_space_limit, host_addr_space_limit );
         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
 
@@ -2995,12 +2995,15 @@ void virtual_private_mapping_apc( const union apc_call *call )
     }
     SERVER_END_REQ;
     if (status || state != PRIVATE_MAPPING_LEASE_PENDING) goto acknowledge;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wtype-limits"
     if (!base || !size || (ULONG_PTR)base < WINE_MANAGED_GUEST_START ||
         (ULONG_PTR)base >= WINE_MANAGED_GUEST_END || size > WINE_MANAGED_GUEST_END - (ULONG_PTR)base ||
         ((ULONG_PTR)base < executor_layout.dispatcher_end &&
          (ULONG_PTR)base + size > executor_layout.shared_data_start) ||
         find_view_range( base, size ) || !private_guest_reservation( base, size ))
     { status = STATUS_CONFLICTING_ADDRESSES; goto complete; }
+#pragma GCC diagnostic pop
     if (!(pages = malloc( size >> page_shift ))) { status = STATUS_NO_MEMORY; goto complete; }
     SERVER_START_REQ( query_private_mapping_lease )
     {
@@ -4229,7 +4232,7 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
     {
         if (!managed_executor || alloc_type || size > executor_layout.ntdll_end - executor_layout.ntdll_start)
             return STATUS_NOT_SUPPORTED;
-        return map_view( view_ret, (void *)executor_layout.ntdll_start, size, 0, vprot,
+        return map_view( view_ret, (void *)(ULONG_PTR)executor_layout.ntdll_start, size, 0, vprot,
                          executor_layout.ntdll_start, executor_layout.ntdll_end, 0, purpose );
     }
 
@@ -4548,7 +4551,7 @@ static void *alloc_virtual_heap( SIZE_T size )
         /* The target's TEB and Wine thread stacks still use guest addresses.
          * VM bookkeeping must not occupy the guest reservation. */
         ret = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
-        if (ret != MAP_FAILED && ret < (void *)(managed_executor ?
+        if (ret != MAP_FAILED && ret < (void *)(ULONG_PTR)(managed_executor ?
                                               executor_layout.host_end : WINE_MANAGED_GUEST_END))
         {
             munmap( ret, size );
@@ -4698,8 +4701,8 @@ void virtual_init(void)
 
     if (is_managed_layout() &&
         (mmap_is_in_reserved_area( (void *)WINE_MANAGED_GUEST_START,
-                                 WINE_MANAGED_GUEST_END - WINE_MANAGED_GUEST_START ) != 1 ||
-         (managed_executor && mmap_is_in_reserved_area( (void *)executor_layout.host_start,
+                                 (SIZE_T)(WINE_MANAGED_GUEST_END - WINE_MANAGED_GUEST_START) ) != 1 ||
+         (managed_executor && mmap_is_in_reserved_area( (void *)(ULONG_PTR)executor_layout.host_start,
                                      executor_layout.host_end - executor_layout.host_start ) != 1)))
     {
         fprintf( stderr, "wine: could not retain managed guest reservation bookkeeping\n" );
@@ -4800,7 +4803,7 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
     info->MmLowestPhysicalPage    = 1;
     info->MmNumberOfPhysicalPages = info->MmHighestPhysicalPage - info->MmLowestPhysicalPage;
     info->AllocationGranularity   = granularity_mask + 1;
-    info->LowestUserAddress       = managed_executor ? (void *)executor_layout.ntdll_end : (void *)0x10000;
+    info->LowestUserAddress       = managed_executor ? (void *)(ULONG_PTR)executor_layout.ntdll_end : (void *)0x10000;
     info->ActiveProcessorsAffinityMask = get_system_affinity_mask();
     info->NumberOfProcessors      = peb->NumberOfProcessors;
     if (wow64) info->HighestUserAddress = (char *)get_wow_user_space_limit() - 1;
@@ -5633,7 +5636,7 @@ void virtual_map_user_shared_data(void)
         server_enter_uninterrupted_section( &virtual_mutex, &sigset );
         view = find_view( user_shared_data, page_size );
         valid = view && view->purpose == MANAGED_VIEW_SHARED_DATA &&
-            view->base == (void *)executor_layout.shared_data_start &&
+            view->base == (void *)(ULONG_PTR)executor_layout.shared_data_start &&
             view->size == executor_layout.shared_data_end - executor_layout.shared_data_start &&
             view->protect == (SEC_COMMIT | VPROT_COMMITTED | VPROT_READ);
         server_leave_uninterrupted_section( &virtual_mutex, &sigset );
@@ -6909,12 +6912,12 @@ static struct file_view *get_memory_region_size( char *base, char **region_start
     {
         if ((ULONG_PTR)base >= executor_layout.ntdll_start && (ULONG_PTR)base < executor_layout.ntdll_end)
         {
-            *region_start = max( *region_start, (char *)executor_layout.ntdll_start );
-            *region_end = min( *region_end, (char *)executor_layout.ntdll_end );
+            *region_start = max( *region_start, (char *)(ULONG_PTR)executor_layout.ntdll_start );
+            *region_end = min( *region_end, (char *)(ULONG_PTR)executor_layout.ntdll_end );
             *fake_reserved = TRUE;
         }
         else if ((ULONG_PTR)base >= executor_layout.ntdll_end)
-            *region_start = max( *region_start, (char *)executor_layout.ntdll_end );
+            *region_start = max( *region_start, (char *)(ULONG_PTR)executor_layout.ntdll_end );
     }
 #ifdef __i386__
     {
@@ -7648,7 +7651,8 @@ NTSTATUS unixcall_map_shared_driver_image( void *args )
     SECTION_BASIC_INFORMATION section_info;
     sigset_t sigset;
     struct stat st;
-    size_t image_size, headers_size, range_count = 0, i, j, returned, mapped_size;
+    size_t image_size, headers_size, range_count = 0, i, j, mapped_size;
+    SIZE_T returned;
     int fd, needs_close;
     NTSTATUS status;
 
