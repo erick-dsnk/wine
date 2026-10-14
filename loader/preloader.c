@@ -816,6 +816,7 @@ static __attribute__((noreturn,format(printf,1,2))) void fatal_error(const char 
     wld_exit(1);
 }
 
+#ifdef __x86_64__
 static unsigned long long parse_managed_hex( const char **str )
 {
     unsigned long long value = 0;
@@ -855,7 +856,6 @@ static void validate_managed_image_range( const char *str )
         fatal_error( "preloader: image range outside managed guest range\n" );
 }
 
-#ifdef __x86_64__
 static void reserve_managed_range( void *start, size_t size, const char *name )
 {
     void *ptr = wld_mmap( start, size, PROT_NONE,
